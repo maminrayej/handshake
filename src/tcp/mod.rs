@@ -1,3 +1,5 @@
+use std::cmp;
+use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
@@ -109,6 +111,18 @@ pub struct SendSpace {
     iss: u32, // initial send sequence number
 }
 
+/*
+                RFC 9293 - S3.3.1 - Fig 4
+
+                       1          2          3
+                   ----------|----------|----------
+                          RCV.NXT    RCV.NXT
+                                    +RCV.WND
+
+        1 - old sequence numbers that have been acknowledged
+        2 - sequence numbers allowed for new reception
+        3 - future sequence numbers that are not yet allowed
+*/
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecvSpace {
     nxt: u32, // receive next
@@ -123,16 +137,17 @@ pub enum Kind {
     Passive,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Noop,
     AddToPending(TCB),
     RemoveFromPending,
     IsEstablished,
     Reset,
+    WakeUpReader,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TCB {
     pub(crate) kind: Kind,
     pub(crate) state: State,
@@ -140,12 +155,17 @@ pub struct TCB {
 
     pub(crate) snd: SendSpace,
     pub(crate) rcv: RecvSpace,
+
+    pub(crate) incoming: VecDeque<u8>,
+    pub(crate) outgoing: VecDeque<u8>,
 }
 
 impl TCB {
     pub fn listen() -> Self {
         // TODO: Choose a random initial sequence number
         let iss = 0;
+
+        let buf = VecDeque::with_capacity(64240);
 
         TCB {
             kind: Kind::Passive,
@@ -154,7 +174,7 @@ impl TCB {
             snd: SendSpace {
                 una: iss,
                 nxt: iss,
-                wnd: 1024,
+                wnd: 0,
                 urp: 0,
                 wl1: 0,
                 wl2: 0,
@@ -162,10 +182,12 @@ impl TCB {
             },
             rcv: RecvSpace {
                 nxt: 0,
-                wnd: 0,
+                wnd: buf.capacity() as u16,
                 urp: 0,
                 irs: 0,
             },
+            incoming: buf,
+            outgoing: VecDeque::new(),
         }
     }
 
@@ -241,15 +263,17 @@ impl TCB {
             if tcph.syn() {
                 self.rcv.nxt = tcph.sequence_number() + 1;
                 self.rcv.irs = tcph.sequence_number();
-                self.rcv.wnd = tcph.window_size();
 
+                self.snd.wnd = tcph.window_size();
                 self.snd.nxt = self.snd.iss + 1;
+
+                self.outgoing.resize(self.snd.wnd as usize, 0);
 
                 self.state = State::SynRcvd;
 
-                write_synack(&ip4h, &tcph, self.snd.iss, self.rcv.nxt, tun);
+                write_synack(&ip4h, &tcph, self.snd.iss, self.rcv.nxt, self.rcv.wnd, tun);
 
-                return Action::AddToPending(*self);
+                return Action::AddToPending(self.clone());
             }
 
             return Action::Noop;
@@ -277,7 +301,7 @@ impl TCB {
                     return Action::Noop;
                 }
 
-                write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, tun);
+                write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
 
                 // After sending the acknowledgment, drop the unacceptable
                 // segment and return.
@@ -473,7 +497,7 @@ impl TCB {
                     self.snd.una = tcph.acknowledgment_number();
                     // TODO: Remove acked buffers from retransmission queue
                 } else if wrapping_lt(self.snd.nxt, tcph.acknowledgment_number()) {
-                    write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, tun);
+                    write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
 
                     return Action::Noop;
                 }
@@ -492,6 +516,75 @@ impl TCB {
                         self.snd.wl2 = tcph.acknowledgment_number();
                     }
                 }
+            }
+
+            // Seventh, process the segment text:
+            if self.state == State::Estab
+                || self.state == State::FinWait1
+                || self.state == State::FinWait2
+            {
+                /*
+                ESTABLISHED STATE
+                FIN-WAIT-1 STATE
+                FIN-WAIT-2 STATE
+                -   Once in the ESTABLISHED state, it is possible to deliver
+                    segment data to user RECEIVE buffers. Data from segments can
+                    be moved into buffers until either the buffer is full or the
+                    segment is empty. If the segment empties and carries a PUSH
+                    flag, then the user is informed, when the buffer is
+                    returned, that a PUSH has been received.
+
+                -   When the TCP endpoint takes responsibility for delivering
+                    the data to the user, it must also acknowledge the receipt
+                    of the data.
+
+                -   Once the TCP endpoint takes responsibility for the data, it
+                    advances RCV.NXT over the data accepted, and adjusts RCV.WND
+                    as appropriate to the current buffer availability. The total
+                    of RCV.NXT and RCV.WND should not be reduced.
+
+                -   A TCP implementation MAY send an ACK segment acknowledging
+                    RCV.NXT when a valid segment arrives that is in the window
+                    but not at the left window edge (MAY-13).
+
+                -   Please note the window management suggestions in Section 3.8.
+
+                -   Send an acknowledgment of the form:
+
+                    <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+
+                -   This acknowledgment should be piggybacked on a segment being
+                    transmitted if possible without incurring undue delay.
+                */
+
+                let new = (self.rcv.nxt.wrapping_sub(tcph.sequence_number())) as usize;
+                let len = data.len() - new;
+                let len = cmp::min(len, self.rcv.wnd as usize);
+
+                let data = &data[new..new + len];
+
+                self.incoming.extend(data.iter());
+
+                self.rcv.nxt = self.rcv.nxt.wrapping_add(len as u32);
+                self.rcv.wnd = self.rcv.wnd - len as u16;
+
+                write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
+
+                return Action::WakeUpReader;
+            } else if self.state == State::CloseWait
+                || self.state == State::Closing
+                || self.state == State::LastAck
+                || self.state == State::TimeWait
+            {
+                /*
+                CLOSE-WAIT STATE
+                CLOSING STATE
+                LAST-ACK STATE
+                TIME-WAIT STATE
+
+                -   This should not occur since a FIN has been received from the
+                    remote side. Ignore the segment text.
+                */
             }
 
             todo!("Some state combination is not implemented")

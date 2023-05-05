@@ -29,9 +29,13 @@ impl TcpListener {
             .get_mut(&self.port)
             .ok_or(Error::PortClosed(self.port))?;
 
+        let (quad, rvar, wvar) = establisheds.1.pop().unwrap();
+
         Ok(TcpStream {
             manager: self.manager.clone(),
-            quad: establisheds.1.pop().unwrap(),
+            quad,
+            rvar,
+            wvar,
         })
     }
 }

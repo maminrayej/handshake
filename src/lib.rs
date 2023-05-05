@@ -18,8 +18,8 @@ use tcp::{write_reset, Action, Dual, Quad, TcpListener, TCB};
 pub struct Manager {
     bounded: HashSet<u16>,
     pending: HashMap<Quad, TCB>,
-    established: HashMap<u16, (Arc<Condvar>, Vec<Quad>)>,
-    streams: HashMap<Quad, TCB>,
+    established: HashMap<u16, (Arc<Condvar>, Vec<(Quad, Arc<Condvar>, Arc<Condvar>)>)>,
+    streams: HashMap<Quad, (TCB, Arc<Condvar>, Arc<Condvar>)>,
 }
 
 #[derive(Debug)]
@@ -74,7 +74,7 @@ impl NetStack {
     }
 }
 
-fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) {
+fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
     loop {
         let mut buf = [0u8; 1500];
 
@@ -97,7 +97,7 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) {
 
         let mut manager = manager.lock().unwrap();
 
-        let action = if let Some(tcb) = manager.streams.get_mut(&quad) {
+        let action = if let Some((tcb, _, _)) = manager.streams.get_mut(&quad) {
             tcb.on_segment(ip4h, tcph, data, &mut tun)
         } else if let Some(tcb) = manager.pending.get_mut(&quad) {
             tcb.on_segment(ip4h, tcph, data, &mut tun)
@@ -138,17 +138,27 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) {
             }
             Action::IsEstablished => {
                 let tcb = manager.pending.remove(&quad).unwrap();
+                let rvar = Arc::new(Condvar::new());
+                let wvar = Arc::new(Condvar::new());
 
-                manager.streams.insert(quad, tcb);
+                manager
+                    .streams
+                    .insert(quad, (tcb, rvar.clone(), wvar.clone()));
 
                 let (cvar, vec) = manager.established.get_mut(&dst.port).unwrap();
-                vec.push(quad);
+                vec.push((quad, rvar, wvar));
                 cvar.notify_one();
             }
             Action::Reset => {
                 // TODO: Signal any read() or write() that the connection has been reset.
 
                 manager.streams.remove(&quad).unwrap();
+            }
+            Action::WakeUpReader => {
+                let (_, rvar, _) = &manager.streams[&quad];
+
+                println!("Notifying the reader");
+                rvar.notify_one();
             }
         }
     }

@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
@@ -13,9 +14,12 @@ fn main() {
 
     let listener = netstack.bind(9090).unwrap();
 
-    let stream = listener.accept();
+    let mut stream = listener.accept().unwrap();
 
-    println!("{stream:?}");
+    let mut buf = [0u8; 1500];
+    let n = stream.read(&mut buf[..]).unwrap();
+
+    println!("Data: {:?}", &buf[..n]);
 
     netstack.join();
 }

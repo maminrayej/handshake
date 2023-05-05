@@ -40,6 +40,7 @@ pub fn write_synack(
     tcph: &TcpHeaderSlice,
     iss: u32,
     ackno: u32,
+    wnd: u16,
     tun: &mut Tun,
 ) {
     let mut tcph = TcpHeader::new(tcph.destination_port(), tcph.source_port(), iss, 1024);
@@ -49,6 +50,7 @@ pub fn write_synack(
     tcph.syn = true;
     tcph.ack = true;
     tcph.acknowledgment_number = ackno;
+    tcph.window_size = wnd;
     tcph.checksum = tcph.calc_checksum_ipv4(&ip4h, &[]).unwrap();
 
     write(&ip4h, &tcph, tun);
@@ -59,6 +61,7 @@ pub fn write_ack(
     tcph: &TcpHeaderSlice,
     sqno: u32,
     ackno: u32,
+    wnd: u16,
     tun: &mut Tun,
 ) {
     let mut tcph = TcpHeader::new(tcph.destination_port(), tcph.source_port(), sqno, 1024);
@@ -67,6 +70,7 @@ pub fn write_ack(
 
     tcph.ack = true;
     tcph.acknowledgment_number = ackno;
+    tcph.window_size = wnd;
     tcph.checksum = tcph.calc_checksum_ipv4(&ip4h, &[]).unwrap();
 
     write(&ip4h, &tcph, tun);
