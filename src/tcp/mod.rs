@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
-use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
+use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice, TcpOptionElement};
 
 mod ioutil;
 mod listen;
@@ -110,6 +110,7 @@ pub struct SendSpace {
     wl1: u32, // segment sequence number used for last window update
     wl2: u32, // segment acknowledgment number used for last window update
     iss: u32, // initial send sequence number
+    mss: u16, // sender maximum segment size
 }
 
 /*
@@ -130,6 +131,7 @@ pub struct RecvSpace {
     wnd: u16, // receive window
     urp: u16, // receive urgent pointer
     irs: u32, // initial receive seqeunce number
+    mss: u16, // receiver maximum segment size
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,7 +140,6 @@ pub enum Kind {
     Passive,
 }
 
-// TODO: Add support for combination of actions to be returned
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Noop,
@@ -152,6 +153,7 @@ pub enum Action {
         wake_up_writer: bool,
         wake_up_closer: bool,
     },
+    ConnectionRefused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,8 +196,9 @@ pub struct TCB {
     pub(crate) timeout: Option<Instant>,
 
     pub(crate) cwnd: u32,
-    pub(crate) rwnd: u32,
     pub(crate) ssthresh: u32,
+
+    pub(crate) probe_timeout: Option<Instant>,
 
     pub(crate) incoming: VecDeque<u8>,
     pub(crate) outgoing: VecDeque<u8>,
@@ -203,10 +206,7 @@ pub struct TCB {
 }
 
 impl TCB {
-    pub fn listen(quad: Quad) -> Self {
-        // TODO: Choose a random initial sequence number
-        let iss = 0;
-
+    pub fn listen(quad: Quad, iss: u32) -> Self {
         let buf = VecDeque::with_capacity(64240);
 
         TCB {
@@ -224,12 +224,14 @@ impl TCB {
                 wl1: 0,
                 wl2: 0,
                 iss,
+                mss: 0,
             },
             rcv: RecvSpace {
                 nxt: 0,
                 wnd: buf.capacity() as u16,
                 urp: 0,
                 irs: 0,
+                mss: 536,
             },
             srtt: 0,
             rttvar: 0,
@@ -254,7 +256,6 @@ impl TCB {
                 IW = 4 * SMSS bytes and MUST NOT be more than 4 segments
             */
             cwnd: 4 * 536,
-            rwnd: 0, // TODO: update rwnd when receiving new segments
             /*
             The initial value of ssthresh SHOULD be set arbitrarily high (e.g.,
             to the size of the largest possible advertised window), but ssthresh
@@ -263,9 +264,11 @@ impl TCB {
             host limit, to dictate the sending rate.
             */
             ssthresh: u32::MAX,
+
             incoming: buf,
             outgoing: VecDeque::new(),
             segments: VecDeque::new(),
+            probe_timeout: None,
         }
     }
 
@@ -278,7 +281,10 @@ impl TCB {
     }
 
     pub fn is_fin_acked(&self) -> bool {
-        todo!()
+        self.outgoing.is_empty()
+            && self.segments.is_empty()
+            && self.snd.una == self.snd.nxt
+            && self.closed
     }
 
     pub fn close(&mut self) {
@@ -305,8 +311,8 @@ impl TCB {
         }
     }
 
-    pub fn on_tick(&mut self, tun: &mut Tun) -> Action {
-        if let Some(timeout) = self.time_wait.clone() {
+    pub fn on_tick(&mut self, tun: &mut Tun) -> bool {
+        if let Some(timeout) = self.timeout.clone() {
             if Instant::now() >= timeout {
                 let seg = self.segments.front_mut().unwrap();
 
@@ -332,14 +338,104 @@ impl TCB {
 
                 self.rto *= 2;
                 self.timeout = Some(seg.sent + Duration::from_millis(self.rto as u64));
+
+                // TODO: Somehow check whether R1 and R2 has been reached
+                /*
+                                        RFC 9293 S3.8.3. TCP Connection Failures
+
+                Excessive retransmission of the same segment by a TCP endpoint
+                indicates some failure of the remote host or the internetwork path.
+                This failure may be of short or long duration. The following
+                procedure MUST be used to handle excessive retransmissions of data
+                segments (MUST-20):
+
+                (a) There are two thresholds R1 and R2 measuring the amount of
+                    retransmission that has occurred for the same segment. R1 and
+                    R2 might be measured in time units or as a count of
+                    retransmissions (with the current RTO and corresponding
+                    backoffs as a conversion factor, if needed).
+
+                (b) When the number of transmissions of the same segment reaches or
+                    exceeds threshold R1, pass negative advice to the IP layer, to
+                    trigger dead-gateway diagnosis.
+
+                (c) When the number of transmissions of the same segment reaches
+                    a threshold R2 greater than R1, close the connection.
+
+                (d) An application MUST (MUST-21) be able to set the value for R2
+                    for a particular connection. For example, an interactive
+                    application might set R2 to "infinity", giving the user control
+                    over when to disconnect.
+
+                (e) TCP implementations SHOULD inform the application of the
+                    delivery problem (unless such information has been disabled by
+                    the application; see the "Asynchronous Reports" section, when
+                    R1 is reached and before R2 (SHLD-9). This will allow a remote
+                    login application program to inform the user, for example.
+
+                The value of R1 SHOULD correspond to at least 3 retransmissions, at
+                the current RTO (SHLD-10). The value of R2 SHOULD correspond to at
+                least 100 seconds (SHLD-11).
+
+                An attempt to open a TCP connection could fail with excessive
+                retransmissions of the SYN segment or by receipt of a RST segment or
+                an ICMP Port Unreachable. SYN retransmissions MUST be handled in the
+                general way just described for data retransmissions, including
+                notification of the application layer.
+
+                However, the values of R1 and R2 may be different for SYN and data
+                segments. In particular, R2 for a SYN segment MUST be set large
+                enough to provide retransmission of the segment for at least 3
+                minutes (MUST-23). The application can close the connection (i.e.,
+                give up on the open attempt) sooner, of course.
+                */
             }
         } else if !self.outgoing.is_empty() {
+            /*
+                    RFC 9293 - S3.8.6.2.1. Sender's Algorithm -- When to Send Data
+
+                The "usable window" is:
+
+                U = SND.UNA + SND.WND - SND.NXT
+
+                i.e., the offered window less the amount of data sent but not
+                acknowledged. If D is the amount of data queued in the sending TCP
+                endpoint but not yet sent, then the following set of rules is
+                recommended.
+
+                Send data:
+
+                (1) if a maximum-sized segment can be sent, i.e., if:
+                    min(D,U) >= Eff.snd.MSS;
+
+                (2) or if the data is pushed and all queued data can be sent now, i.e., if:
+                    [SND.NXT = SND.UNA and] PUSHed and D <= U
+                    (the bracketed condition is imposed by the Nagle algorithm);
+
+                (3)  or if at least a fraction Fs of the maximum window can be sent, i.e., if:
+                    [SND.NXT = SND.UNA and] min(D,U) >= Fs * Max(SND.WND);
+
+                (4) or if the override timeout occurs.
+
+                Here Fs is a fraction whose recommended value is 1/2. The override
+                timeout should be in the range 0.1 - 1.0 seconds. It may be
+                convenient to combine this timer with the timer used to probe
+                zero windows.
+            */
+
+            // TODO: implement Sender SWA
+
             let sent_len = self.snd.nxt.wrapping_sub(self.snd.una) as usize;
             let available_len = self.outgoing.len() - sent_len;
 
-            if available_len > 0 {
-                let data_len = cmp::min(available_len, 536);
-                let fin = data_len == available_len && self.closed;
+            let to_be_sent = cmp::min(
+                cmp::min(available_len, self.cwnd as usize),
+                self.snd.wnd as usize,
+            );
+
+            if to_be_sent > 0 {
+                let data_len = cmp::min(to_be_sent, self.rcv.mss as usize);
+                let fin = data_len == to_be_sent && self.closed;
 
                 let data: Vec<u8> = self
                     .outgoing
@@ -394,11 +490,46 @@ impl TCB {
             );
         } else if let Some(time_wait) = self.time_wait.clone() {
             if time_wait >= Instant::now() {
-                return Action::DeleteTCB;
+                return true;
+            }
+        } else if let Some(probe_timeout) = self.probe_timeout.clone() {
+            /*
+            The sending TCP peer must regularly transmit at least one octet of
+            new data (if available), or retransmit to the receiving TCP peer even
+            if the send window is zero, in order to "probe" the window. This
+            retransmission is essential to guarantee that when either TCP peer
+            has a zero window the reopening of the window will be reliably
+            reported to the other. This is referred to as Zero-Window Probing
+            (ZWP) in other documents.
+
+            Probing of zero (offered) windows MUST be supported (MUST-36).
+
+            A TCP implementation MAY keep its offered receive window closed
+            indefinitely (MAY-8). As long as the receiving TCP peer continues to
+            send acknowledgments in response to the probe segments, the sending
+            TCP peer MUST allow the connection to stay open (MUST-37). This
+            enables TCP to function in scenarios such as the "printer ran out of
+            paper" situation described in Section 4.2.2.17 of [19]. The behavior
+            is subject to the implementation's resource management concerns, as
+            noted in [41].
+
+            When the receiving TCP peer has a zero window and a segment arrives,
+            it must still send an acknowledgment showing its next expected
+            sequence number and current window (zero).
+
+            The transmitting host SHOULD send the first zero-window probe when a
+            zero window has existed for the retransmission timeout period
+            (SHLD-29) (Section 3.8.1), and SHOULD increase exponentially the
+            interval between successive probes (SHLD-30).
+            */
+            if probe_timeout >= Instant::now() {
+                // TODO: send one octet of data or retransmit
+
+                self.probe_timeout = Some(Instant::now() + Duration::from_millis(self.rto as u64));
             }
         }
 
-        Action::Noop
+        false
     }
 
     fn process_ack(&mut self, ackno: u32) -> Option<u128> {
@@ -435,7 +566,7 @@ impl TCB {
             During slow start, a TCP increments cwnd by at most SMSS bytes for
             each ACK received that cumulatively acknowledges new data.
             */
-            self.cwnd += 536;
+            self.cwnd += self.rcv.mss as u32;
         } else {
             /*
             Another common formula that a TCP MAY use to update cwnd during
@@ -456,7 +587,10 @@ impl TCB {
             If the above formula yields 0, the result SHOULD be rounded up to 1
             byte.
             */
-            self.cwnd += cmp::max(((536 * 536) as f64 / self.cwnd as f64) as u32, 1);
+            self.cwnd += cmp::max(
+                ((self.rcv.mss * self.rcv.mss) as f64 / self.cwnd as f64) as u32,
+                1,
+            );
         }
     }
 
@@ -575,11 +709,20 @@ impl TCB {
             }
 
             if tcph.syn() {
+                let mss = tcph
+                    .options_iterator()
+                    .find_map(|op| match op.clone().unwrap() {
+                        TcpOptionElement::MaximumSegmentSize(mss) => Some(mss),
+                        _ => None,
+                    })
+                    .unwrap_or(536);
+
                 self.rcv.nxt = tcph.sequence_number().wrapping_add(1);
                 self.rcv.irs = tcph.sequence_number();
 
                 self.snd.wnd = tcph.window_size();
                 self.snd.nxt = self.snd.iss.wrapping_add(1);
+                self.snd.mss = mss;
 
                 self.outgoing.reserve(self.snd.wnd as usize);
 
@@ -642,7 +785,7 @@ impl TCB {
                     if self.kind == Kind::Passive {
                         return Action::RemoveFromPending;
                     } else {
-                        // TODO: Inform the user that connection has been refused.
+                        return Action::ConnectionRefused;
                     }
                 } else if self.state == State::Estab
                     || self.state == State::FinWait1
@@ -778,6 +921,8 @@ impl TCB {
                     self.snd.wl1 = tcph.sequence_number();
                     self.snd.wl2 = tcph.acknowledgment_number();
 
+                    self.outgoing.reserve_exact(self.snd.wnd as usize);
+
                     return Action::IsEstablished;
                 } else {
                     write_reset(&ip4h, &tcph, data, tun);
@@ -822,6 +967,8 @@ impl TCB {
                 ) {
                     self.snd.una = tcph.acknowledgment_number();
 
+                    self.snd.wnd = tcph.window_size();
+
                     self.congestion_control();
 
                     let r = self.process_ack(tcph.acknowledgment_number());
@@ -857,6 +1004,13 @@ impl TCB {
                         self.snd.wnd = tcph.window_size();
                         self.snd.wl1 = tcph.sequence_number();
                         self.snd.wl2 = tcph.acknowledgment_number();
+
+                        if self.snd.wnd == 0 {
+                            self.probe_timeout =
+                                Some(Instant::now() + Duration::from_millis(self.rto as u64));
+                        } else {
+                            self.probe_timeout.take();
+                        }
                     }
                 }
             } else if self.state == State::LastAck {

@@ -3,9 +3,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
 use nix::poll::{poll, PollFd, PollFlags};
@@ -43,6 +44,7 @@ pub struct StreamEntry {
 
 #[derive(Debug, Default)]
 pub struct Manager {
+    iss: Arc<AtomicU32>,
     bounded: HashSet<u16>,
     pending: HashMap<Quad, TCB>,
     established: HashMap<u16, EstabEntry>,
@@ -53,6 +55,7 @@ pub struct Manager {
 pub struct NetStack {
     manager: Arc<Mutex<Manager>>,
     jh: thread::JoinHandle<()>,
+    ih: thread::JoinHandle<()>,
 }
 
 impl NetStack {
@@ -62,7 +65,25 @@ impl NetStack {
         tun.set_netmask(mask)?;
         tun.bring_up()?;
 
-        let manager = Arc::new(Mutex::new(Manager::default()));
+        let iss = Arc::new(AtomicU32::new(0));
+
+        let ih = {
+            let iss = iss.clone();
+
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_millis(4));
+
+                iss.store(iss.load(Ordering::Acquire), Ordering::Release);
+            })
+        };
+
+        let manager = Arc::new(Mutex::new(Manager {
+            iss,
+            bounded: HashSet::new(),
+            pending: HashMap::new(),
+            established: HashMap::new(),
+            streams: HashMap::new(),
+        }));
 
         let jh = {
             let manager = manager.clone();
@@ -70,7 +91,7 @@ impl NetStack {
             thread::spawn(move || segment_loop(tun, manager.clone()))
         };
 
-        Ok(NetStack { manager, jh })
+        Ok(NetStack { manager, jh, ih })
     }
 
     pub fn bind(&mut self, port: u16) -> Result<TcpListener, Error> {
@@ -110,9 +131,14 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
 
         let mut manager = manager.lock().unwrap();
 
-        for entry in manager.streams.values_mut() {
-            // TODO: Remove the entry if it returns true
-            entry.tcb.on_tick(&mut tun);
+        let mut to_be_deleted = vec![];
+        for (quad, entry) in manager.streams.iter_mut() {
+            if entry.tcb.on_tick(&mut tun) {
+                to_be_deleted.push(*quad);
+            }
+        }
+        for quad in to_be_deleted {
+            manager.streams.remove(&quad).unwrap();
         }
 
         let mut pfd = [PollFd::new(tun.as_raw_fd(), PollFlags::POLLIN)];
@@ -142,7 +168,7 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
         } else if let Some(tcb) = manager.pending.get_mut(&quad) {
             tcb.on_segment(ip4h, tcph, data, &mut tun)
         } else if manager.bounded.contains(&dst.port) {
-            let mut tcb = TCB::listen(quad);
+            let mut tcb = TCB::listen(quad, manager.iss.load(Ordering::Acquire));
 
             tcb.on_segment(ip4h, tcph, data, &mut tun)
         } else {
@@ -210,7 +236,7 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                 stream.reset.store(true, Ordering::Release);
                 stream.rvar.notify_one();
                 stream.wvar.notify_one();
-                // TODO: Should I notify the closer?
+                stream.svar.notify_one();
             }
             Action::CombinedAction {
                 wake_up_reader,
@@ -232,6 +258,9 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                 }
             }
             Action::DeleteTCB => {
+                todo!()
+            }
+            Action::ConnectionRefused => {
                 todo!()
             }
         }
