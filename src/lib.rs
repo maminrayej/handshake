@@ -238,7 +238,7 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                 stream.wvar.notify_one();
                 stream.svar.notify_one();
             }
-            Action::CombinedAction {
+            Action::Wakeup {
                 wake_up_reader,
                 wake_up_writer,
                 wake_up_closer,

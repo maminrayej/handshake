@@ -111,6 +111,8 @@ pub struct SendSpace {
     wl2: u32, // segment acknowledgment number used for last window update
     iss: u32, // initial send sequence number
     mss: u16, // sender maximum segment size
+
+    max_wnd: u16, // maximum window that the receiver has advertised
 }
 
 /*
@@ -148,7 +150,7 @@ pub enum Action {
     IsEstablished,
     Reset,
     DeleteTCB,
-    CombinedAction {
+    Wakeup {
         wake_up_reader: bool,
         wake_up_writer: bool,
         wake_up_closer: bool,
@@ -162,14 +164,16 @@ pub struct Segment {
     una: u32,
     len: u32,
     fin: bool,
+    syn: bool,
 
     retry: bool,
+    total_ret_time: u128,
     sent: Instant,
 }
 
 impl Segment {
     fn end(&self) -> u32 {
-        self.sno + self.len - 1
+        self.sno.wrapping_add(self.len).wrapping_sub(1)
     }
 
     fn unacked_len(&self) -> usize {
@@ -194,6 +198,10 @@ pub struct TCB {
     pub(crate) rto: u128,
     pub(crate) rtt_measured: bool,
     pub(crate) timeout: Option<Instant>,
+    pub(crate) r1: u128,
+    pub(crate) r2: u128,
+    pub(crate) r1_syn: u128,
+    pub(crate) r2_syn: u128,
 
     pub(crate) cwnd: u32,
     pub(crate) ssthresh: u32,
@@ -225,6 +233,7 @@ impl TCB {
                 wl2: 0,
                 iss,
                 mss: 0,
+                max_wnd: 0,
             },
             rcv: RecvSpace {
                 nxt: 0,
@@ -244,6 +253,10 @@ impl TCB {
             rto: 1000,
             rtt_measured: false,
             timeout: None,
+            r1: 50 * 1000,
+            r2: 100 * 1000,
+            r1_syn: 1 * 60 * 1000,
+            r2_syn: 3 * 60 * 1000,
             /*
             IW, the initial value of cwnd, MUST be set using the following
             guidelines as an upper bound.
@@ -265,26 +278,79 @@ impl TCB {
             */
             ssthresh: u32::MAX,
 
+            probe_timeout: None,
+
             incoming: buf,
             outgoing: VecDeque::new(),
             segments: VecDeque::new(),
-            probe_timeout: None,
         }
     }
 
-    pub fn is_slow_start(&self) -> bool {
+    fn is_slow_start(&self) -> bool {
         self.cwnd > self.ssthresh
     }
 
-    pub fn is_outgoing_full(&self) -> bool {
+    fn is_outgoing_full(&self) -> bool {
         self.outgoing.capacity() == self.outgoing.len()
     }
 
-    pub fn is_fin_acked(&self) -> bool {
+    fn is_fin_acked(&self) -> bool {
         self.outgoing.is_empty()
             && self.segments.is_empty()
             && self.snd.una == self.snd.nxt
             && self.closed
+    }
+
+    fn available_data_len(&self) -> usize {
+        let sent_len = self.snd.nxt.wrapping_sub(self.snd.una) as usize;
+        let available_len = self.outgoing.len() - sent_len;
+
+        available_len
+    }
+
+    fn sws_allows_send(&self) -> bool {
+        /*
+                RFC 9293 - S3.8.6.2.1. Sender's Algorithm -- When to Send Data
+
+            The "usable window" is:
+
+            U = SND.UNA + SND.WND - SND.NXT
+
+            i.e., the offered window less the amount of data sent but not
+            acknowledged. If D is the amount of data queued in the sending TCP
+            endpoint but not yet sent, then the following set of rules is
+            recommended.
+
+            Send data:
+
+            (1) if a maximum-sized segment can be sent, i.e., if:
+                min(D,U) >= Eff.snd.MSS;
+
+            (2) or if the data is pushed and all queued data can be sent now, i.e., if:
+                [SND.NXT = SND.UNA and] PUSHed and D <= U
+                (the bracketed condition is imposed by the Nagle algorithm);
+
+            (3)  or if at least a fraction Fs of the maximum window can be sent, i.e., if:
+                [SND.NXT = SND.UNA and] min(D,U) >= Fs * Max(SND.WND);
+
+            (4) or if the override timeout occurs.
+
+            Here Fs is a fraction whose recommended value is 1/2. The override
+            timeout should be in the range 0.1 - 1.0 seconds. It may be
+            convenient to combine this timer with the timer used to probe
+            zero windows.
+        */
+
+        let d = self.available_data_len();
+        let u = self
+            .snd
+            .una
+            .wrapping_add(self.snd.wnd as u32)
+            .wrapping_sub(self.snd.nxt) as usize;
+
+        cmp::min(d, u) >= self.snd.mss as usize
+            || d <= u
+            || cmp::min(d, u) >= (0.5 * self.snd.max_wnd as f64) as usize
     }
 
     pub fn close(&mut self) {
@@ -292,16 +358,21 @@ impl TCB {
 
         self.state = State::FinWait1;
 
-        let sent_len = self.snd.nxt.wrapping_sub(self.snd.una) as usize;
-        let available_len = self.outgoing.len() - sent_len;
-
-        if available_len == 0 {
+        /*
+        When we close the write half of the TCP stream, we must send a FIN.
+        If there is any data available to be sent, FIN will be set on the last segment.
+        But, if there isn't any more data to be sent, we must create an empty segment
+        that contains no data and only contains the fin flag, and put it at the end of the queue.
+        */
+        if self.available_data_len() == 0 {
             let fin = Segment {
                 sno: self.snd.nxt,
                 una: self.snd.nxt,
                 len: 0,
                 fin: true,
+                syn: false,
                 retry: false,
+                total_ret_time: 0,
                 sent: Instant::now(),
             };
 
@@ -309,6 +380,72 @@ impl TCB {
 
             self.snd.nxt = self.snd.nxt.wrapping_add(1);
         }
+    }
+
+    pub fn recv(&mut self, buf: &mut [u8]) -> usize {
+        let len = cmp::min(buf.len(), self.incoming.len());
+
+        let data: Vec<u8> = self.incoming.drain(..len).collect();
+
+        buf[..data.len()].copy_from_slice(&data[..]);
+
+        /*
+                RFC9293 S3.8.6.2.2. Receiver's Algorithm -- When to Send a Window Update
+
+        A TCP implementation MUST include a SWS avoidance algorithm in the
+        receiver (MUST-39).
+
+         The receiver's SWS avoidance algorithm determines when the right
+         window edge may be advanced; this is customarily known as "updating
+         the window". This algorithm combines with the delayed ACK algorithm
+         to determine when an ACK segment containing the current window will
+         really be sent to the receiver. The solution to receiver SWS is to
+         avoid advancing the right window edge RCV.NXT+RCV.WND in small increments,
+         even if data is received from the network in small segments.
+
+         Suppose the total receive buffer space is RCV.BUFF. At any given
+         moment, RCV.USER octets of this total may be tied up with data that
+         has been received and acknowledged but that the user process has not
+         yet consumed. When the connection is quiescent, RCV.WND = RCV.BUFF
+         and RCV.USER = 0.
+
+        Keeping the right window edge fixed as data arrives and is
+        acknowledged requires that the receiver offer less than its full
+        buffer space, i.e., the receiver must specify a RCV.WND that keeps
+        RCV.NXT+RCV.WND constant as RCV.NXT increases. Thus, the total buffer
+        space RCV.BUFF is generally divided into three parts:
+
+               |<------- RCV.BUFF ---------------->|
+                    1             2            3
+           ----|---------|------------------|------|----
+                      RCV.NXT               ^
+                                         (Fixed)
+
+           1 - RCV.USER =  data received but not yet consumed;
+           2 - RCV.WND =   space advertised to sender;
+           3 - Reduction = space available but not yet
+                           advertised.
+
+        The suggested SWS avoidance algorithm for the receiver is to keep
+        RCV.NXT+RCV.WND fixed until the reduction satisfies:
+
+            RCV.BUFF - RCV.USER - RCV.WND  >=  min( Fr * RCV.BUFF, Eff.snd.MSS )
+
+        where Fr is a fraction whose recommended value is 1/2, and
+        Eff.snd.MSS is the effective send MSS for the connection.
+        When the inequality is satisfied, RCV.WND is set to RCV.BUFF-RCV.USER.
+        */
+
+        if self.incoming.capacity() - self.incoming.len() - self.rcv.wnd as usize
+            >= cmp::min(
+                (0.5 * self.incoming.capacity() as f64) as usize,
+                self.snd.mss as usize,
+            )
+        {
+            self.rcv.wnd = (self.incoming.capacity() - self.incoming.len()) as u16;
+        }
+
+        len
     }
 
     pub fn on_tick(&mut self, tun: &mut Tun) -> bool {
@@ -334,14 +471,32 @@ impl TCB {
                 );
 
                 seg.retry = true;
+                seg.total_ret_time += self.rto;
                 seg.sent = Instant::now();
 
                 self.rto *= 2;
                 self.timeout = Some(seg.sent + Duration::from_millis(self.rto as u64));
 
-                // TODO: Somehow check whether R1 and R2 has been reached
+                // TODO: Use retransmission from the start i.e sending the syn/syn-ack segments
+
+                if seg.syn {
+                    if seg.total_ret_time > self.r1_syn {
+                        // TODO: Inform the IP layer
+                        todo!()
+                    } else if seg.total_ret_time > self.r2_syn {
+                        // TODO: Close the connection
+                    }
+                } else {
+                    if seg.total_ret_time > self.r1 {
+                        // TODO: Inform the IP layer
+                        todo!()
+                    } else if seg.total_ret_time > self.r2 {
+                        // TODO: Close the connection
+                    }
+                }
+
                 /*
-                                        RFC 9293 S3.8.3. TCP Connection Failures
+                        RFC 9293 S3.8.3. TCP Connection Failures
 
                 Excessive retransmission of the same segment by a TCP endpoint
                 indicates some failure of the remote host or the internetwork path.
@@ -389,88 +544,60 @@ impl TCB {
                 minutes (MUST-23). The application can close the connection (i.e.,
                 give up on the open attempt) sooner, of course.
                 */
+
+                // TODO: Give the user the ability to set the R2 threshold
             }
         } else if !self.outgoing.is_empty() {
-            /*
-                    RFC 9293 - S3.8.6.2.1. Sender's Algorithm -- When to Send Data
+            if self.sws_allows_send() {
+                let sent_len = self.snd.nxt.wrapping_sub(self.snd.una) as usize;
+                let available_len = self.outgoing.len() - sent_len;
 
-                The "usable window" is:
-
-                U = SND.UNA + SND.WND - SND.NXT
-
-                i.e., the offered window less the amount of data sent but not
-                acknowledged. If D is the amount of data queued in the sending TCP
-                endpoint but not yet sent, then the following set of rules is
-                recommended.
-
-                Send data:
-
-                (1) if a maximum-sized segment can be sent, i.e., if:
-                    min(D,U) >= Eff.snd.MSS;
-
-                (2) or if the data is pushed and all queued data can be sent now, i.e., if:
-                    [SND.NXT = SND.UNA and] PUSHed and D <= U
-                    (the bracketed condition is imposed by the Nagle algorithm);
-
-                (3)  or if at least a fraction Fs of the maximum window can be sent, i.e., if:
-                    [SND.NXT = SND.UNA and] min(D,U) >= Fs * Max(SND.WND);
-
-                (4) or if the override timeout occurs.
-
-                Here Fs is a fraction whose recommended value is 1/2. The override
-                timeout should be in the range 0.1 - 1.0 seconds. It may be
-                convenient to combine this timer with the timer used to probe
-                zero windows.
-            */
-
-            // TODO: implement Sender SWA
-
-            let sent_len = self.snd.nxt.wrapping_sub(self.snd.una) as usize;
-            let available_len = self.outgoing.len() - sent_len;
-
-            let to_be_sent = cmp::min(
-                cmp::min(available_len, self.cwnd as usize),
-                self.snd.wnd as usize,
-            );
-
-            if to_be_sent > 0 {
-                let data_len = cmp::min(to_be_sent, self.rcv.mss as usize);
-                let fin = data_len == to_be_sent && self.closed;
-
-                let data: Vec<u8> = self
-                    .outgoing
-                    .iter()
-                    .copied()
-                    .skip(sent_len)
-                    .take(data_len)
-                    .collect();
-
-                write_data(
-                    self.quad,
-                    self.snd.nxt,
-                    self.rcv.nxt,
-                    self.rcv.wnd,
-                    tun,
-                    data.as_slice(),
-                    fin,
+                let to_be_sent = cmp::min(
+                    cmp::min(available_len, self.cwnd as usize),
+                    self.snd.wnd as usize,
                 );
 
-                let seg = Segment {
-                    sno: self.snd.nxt,
-                    una: self.snd.nxt,
-                    len: data_len as u32,
-                    fin,
-                    retry: false,
-                    sent: Instant::now(),
-                };
+                if to_be_sent > 0 {
+                    let data_len = cmp::min(to_be_sent, self.snd.mss as usize);
+                    let fin = data_len == to_be_sent && self.closed;
 
-                self.segments.push_back(seg);
+                    let data: Vec<u8> = self
+                        .outgoing
+                        .iter()
+                        .copied()
+                        .skip(sent_len)
+                        .take(data_len)
+                        .collect();
 
-                self.snd.nxt = self
-                    .snd
-                    .nxt
-                    .wrapping_add(data_len as u32)
-                    .wrapping_add(if fin { 1 } else { 0 });
+                    write_data(
+                        self.quad,
+                        self.snd.nxt,
+                        self.rcv.nxt,
+                        self.rcv.wnd,
+                        tun,
+                        data.as_slice(),
+                        fin,
+                    );
+
+                    let seg = Segment {
+                        sno: self.snd.nxt,
+                        una: self.snd.nxt,
+                        len: data_len as u32,
+                        fin,
+                        syn: false,
+                        retry: false,
+                        total_ret_time: 0,
+                        sent: Instant::now(),
+                    };
+
+                    self.segments.push_back(seg);
+
+                    self.snd.nxt = self
+                        .snd
+                        .nxt
+                        .wrapping_add(data_len as u32)
+                        .wrapping_add(if fin { 1 } else { 0 });
+                }
             }
         } else if !self.segments.is_empty() {
             let seg = self.segments.pop_front().unwrap();
@@ -494,6 +621,8 @@ impl TCB {
             }
         } else if let Some(probe_timeout) = self.probe_timeout.clone() {
             /*
+                    RFC 9293 S3.8.6.1. Zero-Window Probing
+
             The sending TCP peer must regularly transmit at least one octet of
             new data (if available), or retransmit to the receiving TCP peer even
             if the send window is zero, in order to "probe" the window. This
@@ -535,6 +664,8 @@ impl TCB {
     fn process_ack(&mut self, ackno: u32) -> Option<u128> {
         let mut compute_rto = false;
         let mut r = 0;
+
+        // TODO: preserve the last segment to use for ZWP
         while !self.segments.is_empty() {
             let seg = self.segments.front_mut().unwrap();
             let end = seg.end();
@@ -721,6 +852,7 @@ impl TCB {
                 self.rcv.irs = tcph.sequence_number();
 
                 self.snd.wnd = tcph.window_size();
+                self.snd.max_wnd = tcph.window_size();
                 self.snd.nxt = self.snd.iss.wrapping_add(1);
                 self.snd.mss = mss;
 
@@ -921,6 +1053,10 @@ impl TCB {
                     self.snd.wl1 = tcph.sequence_number();
                     self.snd.wl2 = tcph.acknowledgment_number();
 
+                    if self.snd.wnd > self.snd.max_wnd {
+                        self.snd.max_wnd = self.snd.wnd;
+                    }
+
                     self.outgoing.reserve_exact(self.snd.wnd as usize);
 
                     return Action::IsEstablished;
@@ -967,8 +1103,6 @@ impl TCB {
                 ) {
                     self.snd.una = tcph.acknowledgment_number();
 
-                    self.snd.wnd = tcph.window_size();
-
                     self.congestion_control();
 
                     let r = self.process_ack(tcph.acknowledgment_number());
@@ -1005,6 +1139,10 @@ impl TCB {
                         self.snd.wl1 = tcph.sequence_number();
                         self.snd.wl2 = tcph.acknowledgment_number();
 
+                        if self.snd.wnd > self.snd.max_wnd {
+                            self.snd.wnd = self.snd.max_wnd;
+                        }
+
                         if self.snd.wnd == 0 {
                             self.probe_timeout =
                                 Some(Instant::now() + Duration::from_millis(self.rto as u64));
@@ -1032,8 +1170,6 @@ impl TCB {
                 retransmission of the remote FIN. Acknowledge it, and
                 restart the 2 MSL timeout.
                 */
-
-                // TODO: Make sure that it is actually a retranmission of the remote FIN
 
                 self.time_wait = Some(Instant::now() + Duration::from_secs(2 * 2 * 60));
 
@@ -1113,6 +1249,7 @@ impl TCB {
                 self.incoming.extend(data.iter());
 
                 self.rcv.nxt = self.rcv.nxt.wrapping_add(len as u32);
+
                 self.rcv.wnd = self.rcv.wnd - len as u16;
 
                 write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
@@ -1211,7 +1348,7 @@ impl TCB {
                 }
             }
 
-            return Action::CombinedAction {
+            return Action::Wakeup {
                 wake_up_reader,
                 wake_up_writer,
                 wake_up_closer,
