@@ -12,7 +12,7 @@ mod err;
 pub use err::*;
 
 mod tcp;
-use tcp::{generate_reset, Dual, Quad, State, TcpListener, TCB};
+use tcp::{write_reset, Action, Dual, Quad, State, TcpListener, TCB};
 
 #[derive(Debug, Default)]
 pub struct Manager {
@@ -97,21 +97,14 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) {
 
         let mut manager = manager.lock().unwrap();
 
-        if let Some(_tcb) = manager.streams.get_mut(&quad) {
-            todo!("Streams are not implemented");
-        } else if let Some(_tcb) = manager.pending.get_mut(&quad) {
-            continue;
+        let action = if let Some(tcb) = manager.streams.get_mut(&quad) {
+            tcb.on_segment(ip4h, tcph, data, &mut tun)
+        } else if let Some(tcb) = manager.pending.get_mut(&quad) {
+            tcb.on_segment(ip4h, tcph, data, &mut tun)
         } else if manager.bounded.contains(&dst.port) {
             let mut tcb = TCB::listen();
 
-            if let Some(cursor) = tcb.on_segment(ip4h, tcph, data) {
-                manager.pending.insert(quad, tcb);
-
-                let buf = cursor.get_ref();
-                let pos = cursor.position() as usize;
-
-                tun.write(&buf[..pos]).unwrap();
-            }
+            tcb.on_segment(ip4h, tcph, data, &mut tun)
         } else {
             /*
             If the connection does not exist (CLOSED), then a reset is sent
@@ -130,12 +123,28 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) {
                 continue;
             }
 
-            let cursor = generate_reset(&ip4h, &tcph, data);
+            write_reset(&ip4h, &tcph, data, &mut tun);
 
-            let buf = cursor.get_ref();
-            let pos = cursor.position() as usize;
+            Action::Noop
+        };
 
-            tun.write(&buf[..pos]).unwrap();
+        match action {
+            Action::Noop => continue,
+            Action::AddToPending(tcb) => {
+                manager.pending.insert(quad, tcb);
+            }
+            Action::RemoveFromPending => {
+                manager.pending.remove(&quad);
+            }
+            Action::IsEstablished => {
+                let tcb = manager.pending.remove(&quad).unwrap();
+
+                manager.streams.insert(quad, tcb);
+
+                let (cvar, vec) = manager.established.get_mut(&dst.port).unwrap();
+                vec.push(quad);
+                cvar.notify_one();
+            }
         }
     }
 }

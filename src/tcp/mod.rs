@@ -1,4 +1,3 @@
-use std::io::Cursor;
 use std::net::Ipv4Addr;
 
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
@@ -10,6 +9,7 @@ mod stream;
 pub use ioutil::*;
 pub use listen::*;
 pub use stream::*;
+use tidy_tuntap::Tun;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Dual {
@@ -98,7 +98,7 @@ pub enum State {
 3 - sequence numbers allowed for new data transmission
 4 - future sequence numbers that are not yet allowed
 */
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SendSpace {
     una: u32, // send unacknowledged
     nxt: u32, // send next
@@ -109,7 +109,7 @@ pub struct SendSpace {
     iss: u32, // initial send sequence number
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecvSpace {
     nxt: u32, // receive next
     wnd: u16, // receive window
@@ -117,12 +117,27 @@ pub struct RecvSpace {
     irs: u32, // initial receive seqeunce number
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Active,
+    Passive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Noop,
+    AddToPending(TCB),
+    RemoveFromPending,
+    IsEstablished,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TCB {
+    pub(crate) kind: Kind,
     pub(crate) state: State,
 
-    pub(crate) send_space: SendSpace,
-    pub(crate) recv_space: RecvSpace,
+    pub(crate) snd: SendSpace,
+    pub(crate) rcv: RecvSpace,
 }
 
 impl TCB {
@@ -131,8 +146,9 @@ impl TCB {
         let iss = 0;
 
         TCB {
+            kind: Kind::Passive,
             state: State::Listen,
-            send_space: SendSpace {
+            snd: SendSpace {
                 una: iss,
                 nxt: iss,
                 wnd: 1024,
@@ -141,7 +157,7 @@ impl TCB {
                 wl2: 0,
                 iss,
             },
-            recv_space: RecvSpace {
+            rcv: RecvSpace {
                 nxt: 0,
                 wnd: 0,
                 urp: 0,
@@ -150,13 +166,13 @@ impl TCB {
         }
     }
 
-    #[must_use]
     pub fn on_segment(
         &mut self,
         ip4h: Ipv4HeaderSlice,
         tcph: TcpHeaderSlice,
         data: &[u8],
-    ) -> Option<Cursor<[u8; 1500]>> {
+        tun: &mut Tun,
+    ) -> Action {
         if self.state == State::Listen {
             /*
             If the state is LISTEN, then
@@ -210,32 +226,127 @@ impl TCB {
             */
 
             if tcph.rst() {
-                return None;
+                return Action::Noop;
             }
 
             if tcph.ack() {
-                return Some(generate_reset(&ip4h, &tcph, data));
+                write_reset(&ip4h, &tcph, data, tun);
+
+                return Action::Noop;
             }
 
             if tcph.syn() {
-                self.recv_space.nxt = tcph.sequence_number() + 1;
-                self.recv_space.irs = tcph.sequence_number();
+                self.rcv.nxt = tcph.sequence_number() + 1;
+                self.rcv.irs = tcph.sequence_number();
+                self.rcv.wnd = tcph.window_size();
 
-                self.send_space.nxt = self.send_space.iss + 1;
+                self.snd.nxt = self.snd.iss + 1;
 
                 self.state = State::SynRcvd;
 
-                return Some(generate_synack(
-                    &ip4h,
-                    &tcph,
-                    self.send_space.iss,
-                    self.recv_space.nxt,
-                ));
+                println!("Writing synack");
+                write_synack(&ip4h, &tcph, self.snd.iss, self.rcv.nxt, tun);
+
+                return Action::AddToPending(*self);
             }
 
-            return None;
+            return Action::Noop;
         } else {
-            todo!("Non-Listen states are not implemented")
+            let seg_len =
+                data.len() + if tcph.ack() { 1 } else { 0 } + if tcph.fin() { 1 } else { 0 };
+
+            if !self.is_segment_valid(&tcph, seg_len as u32) {
+                if tcph.rst() {
+                    return Action::Noop;
+                }
+
+                println!("Writing an ack");
+                write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, tun);
+            }
+
+            if tcph.rst() {
+                if self.state == State::SynRcvd {
+                    if self.kind == Kind::Passive {
+                        return Action::RemoveFromPending;
+                    } else {
+                        // TODO: Inform the user that connection has been refused.
+                    }
+                }
+            }
+
+            if tcph.syn() {
+                if self.state == State::SynRcvd {
+                    if self.kind == Kind::Passive {
+                        return Action::RemoveFromPending;
+                    }
+                }
+            }
+
+            if !tcph.ack() {
+                return Action::Noop;
+            }
+
+            if self.state == State::SynRcvd {
+                if is_between_wrapped(
+                    self.snd.una,
+                    tcph.acknowledgment_number(),
+                    self.snd.nxt.wrapping_add(1),
+                ) {
+                    self.snd.wnd = tcph.window_size();
+                    self.snd.wl1 = tcph.sequence_number();
+                    self.snd.wl2 = tcph.acknowledgment_number();
+
+                    self.state = State::Estab;
+
+                    return Action::IsEstablished;
+                } else {
+                    write_reset(&ip4h, &tcph, data, tun);
+                }
+            }
+
+            todo!("Some state combination is not implemented")
         }
     }
+
+    fn is_segment_valid(&self, tcph: &TcpHeaderSlice, seg_len: u32) -> bool {
+        let seg_seq = tcph.sequence_number();
+        let rcv_wnd = self.rcv.wnd as u32;
+        let rcv_nxt = self.rcv.nxt;
+
+        if seg_seq == 0 && rcv_wnd == 0 {
+            seg_seq == rcv_nxt
+        } else if seg_seq == 0 && rcv_wnd > 0 {
+            is_between_wrapped(
+                rcv_nxt.wrapping_sub(1),
+                seg_seq,
+                rcv_nxt.wrapping_add(rcv_wnd),
+            )
+        } else if seg_seq > 0 && rcv_wnd == 0 {
+            false
+        } else if seg_seq > 0 && rcv_wnd > 0 {
+            is_between_wrapped(rcv_nxt, seg_seq, rcv_nxt.wrapping_add(rcv_wnd))
+                || is_between_wrapped(
+                    rcv_nxt.wrapping_sub(1),
+                    seg_seq.wrapping_add(seg_len).wrapping_sub(1),
+                    rcv_nxt.wrapping_add(rcv_wnd),
+                )
+        } else {
+            false
+        }
+    }
+}
+
+fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
+    // From RFC1323:
+    //     TCP determines if a data segment is "old" or "new" by testing
+    //     whether its sequence number is within 2**31 bytes of the left edge
+    //     of the window, and if it is not, discarding the data as "old".  To
+    //     insure that new data is never mistakenly considered old and vice-
+    //     versa, the left edge of the sender's window has to be at most
+    //     2**31 away from the right edge of the receiver's window.
+    lhs.wrapping_sub(rhs) > 2 ^ 31
+}
+
+fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
+    wrapping_lt(start, x) && wrapping_lt(x, end)
 }

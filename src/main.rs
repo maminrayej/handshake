@@ -15,5 +15,7 @@ fn main() {
 
     let stream = listener.accept();
 
+    println!("{stream:?}");
+
     netstack.join();
 }
