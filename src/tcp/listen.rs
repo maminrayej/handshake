@@ -16,7 +16,6 @@ impl TcpListener {
         let mut manager = self.manager.lock().unwrap();
 
         if manager.established[&self.port].elts.is_empty() {
-            // FIXME: This will panic. use get() instead
             manager = self
                 .cvar
                 .wait_while(manager, |manager| {
@@ -35,6 +34,8 @@ impl TcpListener {
             rvar,
             wvar,
             svar,
+            r2,
+            r2_syn,
             reset,
         } = establisheds.elts.pop().unwrap();
 
@@ -44,6 +45,8 @@ impl TcpListener {
             rvar,
             wvar,
             svar,
+            r2,
+            r2_syn,
             closed: false,
             reset,
         })

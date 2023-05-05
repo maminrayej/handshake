@@ -1,6 +1,6 @@
 use std::cmp;
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::{Error, Manager};
@@ -14,6 +14,8 @@ pub struct TcpStream {
     pub(crate) rvar: Arc<Condvar>,
     pub(crate) wvar: Arc<Condvar>,
     pub(crate) svar: Arc<Condvar>,
+    pub(crate) r2_syn: Arc<AtomicU64>,
+    pub(crate) r2: Arc<AtomicU64>,
     pub(crate) closed: bool,
     pub(crate) reset: Arc<AtomicBool>,
 }
@@ -26,10 +28,17 @@ impl TcpStream {
 
         manager.streams.get_mut(&self.quad).unwrap().tcb.close();
 
-        // TODO: Do something about the spurious wake ups
         manager = self.svar.wait(manager).unwrap();
 
         drop(manager)
+    }
+
+    pub fn set_r2(&self, r2: u64) {
+        self.r2.store(r2, Ordering::Release);
+    }
+
+    pub fn set_r2_syn(&self, r2: u64) {
+        self.r2_syn.store(r2, Ordering::Release);
     }
 }
 

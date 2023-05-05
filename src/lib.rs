@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -24,6 +24,8 @@ pub struct EstabElement {
     rvar: Arc<Condvar>,
     wvar: Arc<Condvar>,
     svar: Arc<Condvar>,
+    r2_syn: Arc<AtomicU64>,
+    r2: Arc<AtomicU64>,
     reset: Arc<AtomicBool>,
 }
 
@@ -122,6 +124,7 @@ impl NetStack {
 
     pub fn join(self) {
         self.jh.join().unwrap();
+        self.ih.join().unwrap();
     }
 }
 
@@ -134,6 +137,16 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
         let mut to_be_deleted = vec![];
         for (quad, entry) in manager.streams.iter_mut() {
             if entry.tcb.on_tick(&mut tun) {
+                to_be_deleted.push(*quad);
+            }
+        }
+        for quad in to_be_deleted {
+            manager.streams.remove(&quad).unwrap();
+        }
+
+        let mut to_be_deleted = vec![];
+        for (quad, tcb) in manager.pending.iter_mut() {
+            if tcb.on_tick(&mut tun) {
                 to_be_deleted.push(*quad);
             }
         }
@@ -207,6 +220,8 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                 let rvar = Arc::new(Condvar::new());
                 let wvar = Arc::new(Condvar::new());
                 let svar = Arc::new(Condvar::new());
+                let r2 = tcb.r2.clone();
+                let r2_syn = tcb.r2_syn.clone();
                 let reset = Arc::new(AtomicBool::new(false));
 
                 manager.streams.insert(
@@ -226,6 +241,8 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                     rvar,
                     wvar,
                     svar,
+                    r2,
+                    r2_syn,
                     reset,
                 });
                 cvar.notify_one();
