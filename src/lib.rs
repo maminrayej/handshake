@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -21,6 +22,8 @@ pub struct EstabElement {
     quad: Quad,
     rvar: Arc<Condvar>,
     wvar: Arc<Condvar>,
+    svar: Arc<Condvar>,
+    reset: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -34,6 +37,8 @@ pub struct StreamEntry {
     tcb: TCB,
     rvar: Arc<Condvar>,
     wvar: Arc<Condvar>,
+    svar: Arc<Condvar>,
+    reset: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Default)]
@@ -114,7 +119,7 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
         if poll(&mut pfd[..], 1).unwrap() == 0 {
             continue;
         }
-        
+
         let n = tun.read(&mut buf).unwrap();
 
         let Ok(ip4h) = Ipv4HeaderSlice::from_slice(&buf[..n]) else { continue };
@@ -175,6 +180,8 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                 let tcb = manager.pending.remove(&quad).unwrap();
                 let rvar = Arc::new(Condvar::new());
                 let wvar = Arc::new(Condvar::new());
+                let svar = Arc::new(Condvar::new());
+                let reset = Arc::new(AtomicBool::new(false));
 
                 manager.streams.insert(
                     quad,
@@ -182,30 +189,50 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                         tcb,
                         rvar: rvar.clone(),
                         wvar: wvar.clone(),
+                        svar: svar.clone(),
+                        reset: reset.clone(),
                     },
                 );
 
                 let EstabEntry { cvar, elts } = manager.established.get_mut(&dst.port).unwrap();
-                elts.push(EstabElement { quad, rvar, wvar });
+                elts.push(EstabElement {
+                    quad,
+                    rvar,
+                    wvar,
+                    svar,
+                    reset,
+                });
                 cvar.notify_one();
             }
             Action::Reset => {
-                // TODO: Signal any read() or write() that the connection has been reset.
+                let stream = manager.streams.remove(&quad).unwrap();
 
-                manager.streams.remove(&quad).unwrap();
+                stream.reset.store(true, Ordering::Release);
+                stream.rvar.notify_one();
+                stream.wvar.notify_one();
+                // TODO: Should I notify the closer?
             }
-            Action::WakeUpReader => {
-                let StreamEntry { rvar, .. } = &manager.streams[&quad];
+            Action::CombinedAction {
+                wake_up_reader,
+                wake_up_writer,
+                wake_up_closer,
+            } => {
+                let StreamEntry {
+                    rvar, wvar, svar, ..
+                } = &manager.streams[&quad];
 
-                rvar.notify_one();
-            }
-            Action::WakeUpWriter => {
-                let StreamEntry { wvar, .. } = &manager.streams[&quad];
-
-                wvar.notify_one();
+                if wake_up_reader {
+                    rvar.notify_one();
+                }
+                if wake_up_writer {
+                    wvar.notify_one();
+                }
+                if wake_up_closer {
+                    svar.notify_one();
+                }
             }
             Action::DeleteTCB => {
-                unreachable!()
+                todo!()
             }
         }
     }

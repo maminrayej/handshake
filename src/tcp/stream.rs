@@ -1,5 +1,6 @@
 use std::cmp;
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::{Error, Manager};
@@ -12,7 +13,9 @@ pub struct TcpStream {
     pub(crate) quad: Quad,
     pub(crate) rvar: Arc<Condvar>,
     pub(crate) wvar: Arc<Condvar>,
+    pub(crate) svar: Arc<Condvar>,
     pub(crate) closed: bool,
+    pub(crate) reset: Arc<AtomicBool>,
 }
 
 impl TcpStream {
@@ -23,12 +26,22 @@ impl TcpStream {
 
         manager.streams.get_mut(&self.quad).unwrap().tcb.close();
 
-        // TODO: Block until our fin has been acked.
+        // TODO: Do something about the spurious wake ups
+        manager = self.svar.wait(manager).unwrap();
+
+        drop(manager)
     }
 }
 
 impl Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.reset.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "Connection has been reset",
+            ));
+        }
+
         let mut manager = self.manager.lock().unwrap();
 
         if manager
@@ -43,8 +56,16 @@ impl Read for TcpStream {
                 .rvar
                 .wait_while(manager, |manager| {
                     manager.streams[&self.quad].tcb.incoming.is_empty()
+                        || !self.reset.load(Ordering::Acquire)
                 })
                 .unwrap();
+        }
+
+        if self.reset.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "Connection has been reset",
+            ));
         }
 
         let incoming = &mut manager
@@ -73,6 +94,13 @@ impl Write for TcpStream {
             ));
         }
 
+        if self.reset.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "Connection has been reset",
+            ));
+        }
+
         let mut manager = self.manager.lock().unwrap();
 
         if manager
@@ -86,8 +114,16 @@ impl Write for TcpStream {
                 .wvar
                 .wait_while(manager, |manager| {
                     manager.streams[&self.quad].tcb.is_outgoing_full()
+                        || !self.reset.load(Ordering::Acquire)
                 })
                 .unwrap();
+        }
+
+        if self.reset.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "Connection has been reset",
+            ));
         }
 
         let outgoing = &mut manager
@@ -119,13 +155,21 @@ impl Write for TcpStream {
                 .wvar
                 .wait_while(manager, |manager| {
                     !manager.streams[&self.quad].tcb.outgoing.is_empty()
+                        || !self.reset.load(Ordering::Acquire)
                 })
                 .unwrap();
         }
 
         drop(manager);
 
-        Ok(())
+        if self.reset.load(Ordering::Acquire) {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "Connection has been reset",
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 

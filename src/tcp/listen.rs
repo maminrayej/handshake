@@ -30,14 +30,22 @@ impl TcpListener {
             .get_mut(&self.port)
             .ok_or(Error::PortClosed(self.port))?;
 
-        let EstabElement { quad, rvar, wvar } = establisheds.elts.pop().unwrap();
+        let EstabElement {
+            quad,
+            rvar,
+            wvar,
+            svar,
+            reset,
+        } = establisheds.elts.pop().unwrap();
 
         Ok(TcpStream {
             manager: self.manager.clone(),
             quad,
             rvar,
             wvar,
+            svar,
             closed: false,
+            reset,
         })
     }
 }

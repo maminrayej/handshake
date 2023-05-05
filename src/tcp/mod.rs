@@ -146,9 +146,12 @@ pub enum Action {
     RemoveFromPending,
     IsEstablished,
     Reset,
-    WakeUpReader,
     DeleteTCB,
-    WakeUpWriter,
+    CombinedAction {
+        wake_up_reader: bool,
+        wake_up_writer: bool,
+        wake_up_closer: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,6 +277,10 @@ impl TCB {
         self.outgoing.capacity() == self.outgoing.len()
     }
 
+    pub fn is_fin_acked(&self) -> bool {
+        todo!()
+    }
+
     pub fn close(&mut self) {
         self.closed = true;
 
@@ -392,6 +399,110 @@ impl TCB {
         }
 
         Action::Noop
+    }
+
+    fn process_ack(&mut self, ackno: u32) -> Option<u128> {
+        let mut compute_rto = false;
+        let mut r = 0;
+        while !self.segments.is_empty() {
+            let seg = self.segments.front_mut().unwrap();
+            let end = seg.end();
+
+            compute_rto = seg.retry == false;
+            r = (Instant::now() - seg.sent).as_millis();
+
+            if is_between_wrapped(seg.una, ackno, end.wrapping_add(1)) {
+                // Partial acknowledgment
+
+                let acked = ackno.wrapping_sub(seg.una);
+                self.outgoing.drain(..acked as usize);
+
+                seg.una = ackno;
+            } else if wrapping_lt(end, ackno) {
+                // Full acknowledgment
+
+                let seg = self.segments.pop_front().unwrap();
+                self.outgoing.drain(..seg.unacked_len());
+            }
+        }
+
+        compute_rto.then_some(r)
+    }
+
+    fn congestion_control(&mut self) {
+        if self.is_slow_start() {
+            /*
+            During slow start, a TCP increments cwnd by at most SMSS bytes for
+            each ACK received that cumulatively acknowledges new data.
+            */
+            self.cwnd += 536;
+        } else {
+            /*
+            Another common formula that a TCP MAY use to update cwnd during
+            congestion avoidance is given in equation (3):
+
+                cwnd += SMSS*SMSS/cwnd                     (3)
+
+            This adjustment is executed on every incoming ACK that acknowledges
+            new data.  Equation (3) provides an acceptable approximation to the
+            underlying principle of increasing cwnd by 1 full-sized segment per
+            RTT.  (Note that for a connection in which the receiver is
+            acknowledging every-other packet, (3) is less aggressive than allowed
+            -- roughly increasing cwnd every second RTT.)
+
+            Implementation Note: Since integer arithmetic is usually used in TCP
+            implementations, the formula given in equation (3) can fail to
+            increase cwnd when the congestion window is larger than SMSS*SMSS.
+            If the above formula yields 0, the result SHOULD be rounded up to 1
+            byte.
+            */
+            self.cwnd += cmp::max(((536 * 536) as f64 / self.cwnd as f64) as u32, 1);
+        }
+    }
+
+    fn compute_rto(&mut self, r: u128) {
+        /*
+        -   When the first RTT measurement R is made, the host MUST set
+
+                SRTT <- R
+                RTTVAR <- R/2
+                RTO <- SRTT + max (G, K*RTTVAR)
+
+            where K = 4.
+
+        -   When a subsequent RTT measurement R' is made, a host MUST set
+
+                RTTVAR <- (1 - beta) * RTTVAR + beta * |SRTT - R'|
+                SRTT <- (1 - alpha) * SRTT + alpha * R'
+
+            The value of SRTT used in the update to RTTVAR is its value
+            before updating SRTT itself using the second assignment.  That
+            is, updating RTTVAR and SRTT MUST be computed in the above
+            order.
+
+            The above SHOULD be computed using alpha=1/8 and beta=1/4.
+
+        -   After the computation, a host MUST update
+
+                RTO <- SRTT + max (G, K*RTTVAR)
+        */
+        if !self.rtt_measured {
+            self.srtt = r;
+            self.rttvar = r / 2;
+            self.rtt_measured = true;
+        } else {
+            self.rttvar =
+                ((1.0 - 0.25) * self.rttvar as f64 + 0.25 * self.srtt.abs_diff(r) as f64) as u128;
+            self.srtt = ((1.0 - 0.125) * self.srtt as f64 + 0.125 * r as f64) as u128;
+        }
+
+        self.rto = self.srtt + cmp::max(100, 4 * self.rttvar);
+
+        /*
+        Whenever RTO is computed, if it is less than 1 second, then the
+        RTO SHOULD be rounded up to 1 second.
+        */
+        self.rto = cmp::min(self.rto, 1000);
     }
 
     pub fn on_segment(
@@ -620,7 +731,8 @@ impl TCB {
                         (sequence number check).
                     */
 
-                    // TODO: For now we don't implement RFC 5961 so we just send a reset.
+                    // For now we don't implement RFC 5961 so we just send a reset.
+                    // FIXME: It must only write a reset if SYN is in the window
                     write_reset(&ip4h, &tcph, data, tun);
 
                     return Action::Reset;
@@ -632,6 +744,10 @@ impl TCB {
             if !tcph.ack() {
                 return Action::Noop;
             }
+
+            let mut wake_up_reader = false;
+            let mut wake_up_writer = false;
+            let mut wake_up_closer = false;
 
             if self.state == State::SynRcvd {
                 /*
@@ -665,10 +781,14 @@ impl TCB {
                     return Action::IsEstablished;
                 } else {
                     write_reset(&ip4h, &tcph, data, tun);
+
+                    return Action::Noop;
                 }
             } else if self.state == State::Estab
                 || self.state == State::FinWait1
                 || self.state == State::FinWait2
+                || self.state == State::CloseWait
+                || self.state == State::Closing
             {
                 /*
                 ESTABLISHED STATE
@@ -702,105 +822,12 @@ impl TCB {
                 ) {
                     self.snd.una = tcph.acknowledgment_number();
 
-                    if self.is_slow_start() {
-                        /*
-                        During slow start, a TCP increments cwnd by at most SMSS bytes for
-                        each ACK received that cumulatively acknowledges new data.
-                        */
-                        self.cwnd += 536;
-                    } else {
-                        /*
-                        Another common formula that a TCP MAY use to update cwnd during
-                        congestion avoidance is given in equation (3):
+                    self.congestion_control();
 
-                            cwnd += SMSS*SMSS/cwnd                     (3)
+                    let r = self.process_ack(tcph.acknowledgment_number());
 
-                        This adjustment is executed on every incoming ACK that acknowledges
-                        new data.  Equation (3) provides an acceptable approximation to the
-                        underlying principle of increasing cwnd by 1 full-sized segment per
-                        RTT.  (Note that for a connection in which the receiver is
-                        acknowledging every-other packet, (3) is less aggressive than allowed
-                        -- roughly increasing cwnd every second RTT.)
-
-                        Implementation Note: Since integer arithmetic is usually used in TCP
-                        implementations, the formula given in equation (3) can fail to
-                        increase cwnd when the congestion window is larger than SMSS*SMSS.
-                        If the above formula yields 0, the result SHOULD be rounded up to 1
-                        byte.
-                        */
-                        self.cwnd += cmp::max(((536 * 536) as f64 / self.cwnd as f64) as u32, 1);
-                    }
-
-                    let mut compute_rto = false;
-                    let mut r = 0;
-                    while !self.segments.is_empty() {
-                        let seg = self.segments.front_mut().unwrap();
-                        let end = seg.end();
-                        let ackno = tcph.acknowledgment_number();
-
-                        compute_rto = seg.retry == false;
-                        r = (Instant::now() - seg.sent).as_millis();
-
-                        if is_between_wrapped(seg.una, ackno, end.wrapping_add(1)) {
-                            // Partial acknowledgment
-
-                            let acked = ackno.wrapping_sub(seg.una);
-                            self.outgoing.drain(..acked as usize);
-
-                            seg.una = ackno;
-                        } else if wrapping_lt(end, ackno) {
-                            // Full acknowledgment
-
-                            let seg = self.segments.pop_front().unwrap();
-                            self.outgoing.drain(..seg.unacked_len());
-                        }
-                    }
-
-                    if compute_rto {
-                        /*
-                        -   When the first RTT measurement R is made, the host MUST set
-
-                                SRTT <- R
-                                RTTVAR <- R/2
-                                RTO <- SRTT + max (G, K*RTTVAR)
-
-                            where K = 4.
-
-                        -   When a subsequent RTT measurement R' is made, a host MUST set
-
-                                RTTVAR <- (1 - beta) * RTTVAR + beta * |SRTT - R'|
-                                SRTT <- (1 - alpha) * SRTT + alpha * R'
-
-                            The value of SRTT used in the update to RTTVAR is its value
-                            before updating SRTT itself using the second assignment.  That
-                            is, updating RTTVAR and SRTT MUST be computed in the above
-                            order.
-
-                            The above SHOULD be computed using alpha=1/8 and beta=1/4.
-
-                        -   After the computation, a host MUST update
-
-                                RTO <- SRTT + max (G, K*RTTVAR)
-                        */
-                        if !self.rtt_measured {
-                            self.srtt = r;
-                            self.rttvar = r / 2;
-                            self.rtt_measured = true;
-                        } else {
-                            self.rttvar = ((1.0 - 0.25) * self.rttvar as f64
-                                + 0.25 * self.srtt.abs_diff(r) as f64)
-                                as u128;
-                            self.srtt =
-                                ((1.0 - 0.125) * self.srtt as f64 + 0.125 * r as f64) as u128;
-                        }
-
-                        self.rto = self.srtt + cmp::max(100, 4 * self.rttvar);
-
-                        /*
-                        Whenever RTO is computed, if it is less than 1 second, then the
-                        RTO SHOULD be rounded up to 1 second.
-                        */
-                        self.rto = cmp::min(self.rto, 1000);
+                    if let Some(r) = r {
+                        self.compute_rto(r);
                     }
 
                     if self.segments.is_empty() {
@@ -811,7 +838,7 @@ impl TCB {
                         self.timeout = Some(seg.sent + Duration::from_millis(self.rto as u64));
                     }
 
-                    return Action::WakeUpWriter;
+                    wake_up_writer = true;
                 } else if wrapping_lt(self.snd.nxt, tcph.acknowledgment_number()) {
                     write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
 
@@ -832,17 +859,56 @@ impl TCB {
                         self.snd.wl2 = tcph.acknowledgment_number();
                     }
                 }
+            } else if self.state == State::LastAck {
+                /*
+                The only thing that can arrive in this state is an
+                acknowledgment of our FIN. If our FIN is now
+                acknowledged, delete the TCB, enter the CLOSED state,
+                and return
+                */
+
+                self.process_ack(tcph.acknowledgment_number());
+
+                if self.is_fin_acked() {
+                    return Action::DeleteTCB;
+                }
+            } else if self.state == State::TimeWait {
+                /*
+                The only thing that can arrive in this state is a
+                retransmission of the remote FIN. Acknowledge it, and
+                restart the 2 MSL timeout.
+                */
+
+                // TODO: Make sure that it is actually a retranmission of the remote FIN
+
+                self.time_wait = Some(Instant::now() + Duration::from_secs(2 * 2 * 60));
+
+                write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
             }
 
+            /*
+            In addition to the processing for the ESTABLISHED state,
+            if the FIN segment is now acknowledged, then enter FIN-
+            WAIT-2 and continue processing in that state.
+            */
             if self.state == State::FinWait1 {
-                if self.outgoing.is_empty()
-                    && self.segments.is_empty()
-                    && self.snd.una == self.snd.nxt
-                {
+                if self.is_fin_acked() {
                     self.state = State::FinWait2;
-
-                    // TODO: Wake up stream.close()
                 }
+            }
+
+            /*
+            In addition to the processing for the ESTABLISHED state,
+            if the retransmission queue is empty, the user's CLOSE
+            can be acknowledged ("ok") but do not delete the TCB.
+            */
+            if self.state == State::FinWait2 {
+                /*
+                Our FIN has been acke so there are no other segment
+                to be retransmitted.
+                */
+
+                wake_up_closer = true;
             }
 
             // Seventh, process the segment text:
@@ -897,7 +963,7 @@ impl TCB {
 
                 write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
 
-                return Action::WakeUpReader;
+                wake_up_reader = true;
             } else if self.state == State::CloseWait
                 || self.state == State::Closing
                 || self.state == State::LastAck
@@ -964,7 +1030,13 @@ impl TCB {
                 }
 
                 if self.state == State::FinWait1 {
-                    todo!()
+                    if self.is_fin_acked() {
+                        self.state = State::TimeWait;
+                        self.timeout = None;
+                        self.time_wait = Some(Instant::now() + Duration::from_secs(2 * 2 * 60));
+                    } else {
+                        self.state = State::Closing;
+                    }
                 }
 
                 if self.state == State::FinWait2 {
@@ -985,7 +1057,11 @@ impl TCB {
                 }
             }
 
-            todo!("Some state combination is not implemented")
+            return Action::CombinedAction {
+                wake_up_reader,
+                wake_up_writer,
+                wake_up_closer,
+            };
         }
     }
 
