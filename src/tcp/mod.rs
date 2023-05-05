@@ -244,7 +244,6 @@ impl TCB {
 
                 self.state = State::SynRcvd;
 
-                println!("Writing synack");
                 write_synack(&ip4h, &tcph, self.snd.iss, self.rcv.nxt, tun);
 
                 return Action::AddToPending(*self);
@@ -252,19 +251,51 @@ impl TCB {
 
             return Action::Noop;
         } else {
+            /*
+            Otherwise,
+                First, check sequence number:
+                -   SYN-RECEIVED STATE
+                -   ESTABLISHED STATE
+                -   FIN-WAIT-1 STATE
+                -   FIN-WAIT-2 STATE
+                -   CLOSE-WAIT STATE
+                -   CLOSING STATE
+                -   LAST-ACK STATE
+                -   TIME-WAIT STATE
+            */
             let seg_len =
                 data.len() + if tcph.ack() { 1 } else { 0 } + if tcph.fin() { 1 } else { 0 };
 
+            // If an incoming segment is not acceptable, an acknowledgment
+            // should be sent in reply (unless the RST bit is set, if so
+            // drop the segment and return)
             if !self.is_segment_valid(&tcph, seg_len as u32) {
                 if tcph.rst() {
                     return Action::Noop;
                 }
 
-                println!("Writing an ack");
                 write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, tun);
+
+                // After sending the acknowledgment, drop the unacceptable
+                // segment and return.
+                return Action::Noop;
             }
 
+            // Second, check the RST bit
             if tcph.rst() {
+                /*
+                SYN-RECEIVED STATE
+                    If the RST bit is set,
+                        If this connection was initiated with a passive OPEN
+                        (i.e., came from the LISTEN state), then return this
+                        connection to LISTEN state and return. The user need not
+                        be informed. If this connection was initiated with an
+                        active OPEN (i.e., came from SYN-SENT state), then the
+                        connection was refused; signal the user "connection
+                        refused". In either case, the retransmission queue should
+                        be flushed. And in the active OPEN case, enter the CLOSED
+                        state and delete the TCB, and return.
+                 */
                 if self.state == State::SynRcvd {
                     if self.kind == Kind::Passive {
                         return Action::RemoveFromPending;
@@ -274,7 +305,15 @@ impl TCB {
                 }
             }
 
+            // Fourth, check the SYN bit:
             if tcph.syn() {
+                /*
+                SYN-RECEIVED STATE
+                    If the connection was initiated with a passive OPEN, then
+                    return this connection to the LISTEN state and return.
+                    Otherwise, handle per the directions for synchronized states
+                    below.
+                 */
                 if self.state == State::SynRcvd {
                     if self.kind == Kind::Passive {
                         return Action::RemoveFromPending;
@@ -282,21 +321,39 @@ impl TCB {
                 }
             }
 
+            // Fifth, check the ACK field:
+            // -    if the ACK bit is off, drop the segment and return
             if !tcph.ack() {
                 return Action::Noop;
             }
 
+            /*
+            SYN-RECEIVED STATE
+                If SND.UNA < SEG.ACK =< SND.NXT, then enter ESTABLISHED
+                state and continue processing with the variables below
+                set to:
+
+                    SND.WND <- SEG.WND
+                    SND.WL1 <- SEG.SEQ
+                    SND.WL2 <- SEG.ACK
+
+                If the segment acknowledgment is not acceptable, form a reset segment
+
+                    <SEQ=SEG.ACK><CTL=RST>
+
+                and send it.
+            */
             if self.state == State::SynRcvd {
                 if is_between_wrapped(
                     self.snd.una,
                     tcph.acknowledgment_number(),
                     self.snd.nxt.wrapping_add(1),
                 ) {
+                    self.state = State::Estab;
+
                     self.snd.wnd = tcph.window_size();
                     self.snd.wl1 = tcph.sequence_number();
                     self.snd.wl2 = tcph.acknowledgment_number();
-
-                    self.state = State::Estab;
 
                     return Action::IsEstablished;
                 } else {
@@ -308,28 +365,48 @@ impl TCB {
         }
     }
 
+    /*
+    There are four cases for the acceptability test for an
+    incoming segment:
+
+    Segment Length 	Receive Window 	Test
+    0 	            0 	            SEG.SEQ = RCV.NXT
+
+    0 	            >0 	            RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
+
+    >0 	            0 	            not acceptable
+
+                                    RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
+
+    >0 	            >0              or
+
+                                    RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
+    */
     fn is_segment_valid(&self, tcph: &TcpHeaderSlice, seg_len: u32) -> bool {
         let seg_seq = tcph.sequence_number();
         let rcv_wnd = self.rcv.wnd as u32;
         let rcv_nxt = self.rcv.nxt;
 
-        if seg_seq == 0 && rcv_wnd == 0 {
+        if seg_len == 0 && rcv_wnd == 0 {
             seg_seq == rcv_nxt
-        } else if seg_seq == 0 && rcv_wnd > 0 {
+        } else if seg_len == 0 && rcv_wnd > 0 {
             is_between_wrapped(
                 rcv_nxt.wrapping_sub(1),
                 seg_seq,
                 rcv_nxt.wrapping_add(rcv_wnd),
             )
-        } else if seg_seq > 0 && rcv_wnd == 0 {
+        } else if seg_len > 0 && rcv_wnd == 0 {
             false
-        } else if seg_seq > 0 && rcv_wnd > 0 {
-            is_between_wrapped(rcv_nxt, seg_seq, rcv_nxt.wrapping_add(rcv_wnd))
-                || is_between_wrapped(
-                    rcv_nxt.wrapping_sub(1),
-                    seg_seq.wrapping_add(seg_len).wrapping_sub(1),
-                    rcv_nxt.wrapping_add(rcv_wnd),
-                )
+        } else if seg_len > 0 && rcv_wnd > 0 {
+            is_between_wrapped(
+                rcv_nxt.wrapping_sub(1),
+                seg_seq,
+                rcv_nxt.wrapping_add(rcv_wnd),
+            ) || is_between_wrapped(
+                rcv_nxt.wrapping_sub(1),
+                seg_seq.wrapping_add(seg_len).wrapping_sub(1),
+                rcv_nxt.wrapping_add(rcv_wnd),
+            )
         } else {
             false
         }

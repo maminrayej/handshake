@@ -1,18 +1,18 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::io::{Cursor, Read, Write};
+use std::io::Read;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use etherparse::{Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
+use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
 use tidy_tuntap::Tun;
 
 mod err;
 pub use err::*;
 
 mod tcp;
-use tcp::{write_reset, Action, Dual, Quad, State, TcpListener, TCB};
+use tcp::{write_reset, Action, Dual, Quad, TcpListener, TCB};
 
 #[derive(Debug, Default)]
 pub struct Manager {
