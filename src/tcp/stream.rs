@@ -22,34 +22,28 @@ impl Read for TcpStream {
             .streams
             .get_mut(&self.quad)
             .ok_or(Error::StreamClosed(self.quad.src))?
-            .0
+            .tcb
             .incoming
             .is_empty()
         {
-            println!("Incoming is empty. Waiting...");
-
             manager = self
                 .rvar
                 .wait_while(manager, |manager| {
-                    manager.streams[&self.quad].0.incoming.is_empty()
+                    manager.streams[&self.quad].tcb.incoming.is_empty()
                 })
                 .unwrap();
         }
-
-        println!("Waiting is over!");
 
         let incoming = &mut manager
             .streams
             .get_mut(&self.quad)
             .ok_or(Error::StreamClosed(self.quad.src))?
-            .0
+            .tcb
             .incoming;
 
         let end = cmp::min(buf.len(), incoming.len());
 
         let data: Vec<u8> = incoming.drain(..end).collect();
-
-        println!("Drained data len: {}", data.len());
 
         buf[..data.len()].copy_from_slice(&data[..]);
 

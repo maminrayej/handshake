@@ -1,6 +1,6 @@
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::{Error, Manager};
+use crate::{Error, EstabElement, Manager};
 
 use super::stream::TcpStream;
 
@@ -15,11 +15,12 @@ impl TcpListener {
     pub fn accept(&self) -> Result<TcpStream, Error> {
         let mut manager = self.manager.lock().unwrap();
 
-        if manager.established[&self.port].1.is_empty() {
+        if manager.established[&self.port].elts.is_empty() {
+            // FIXME: This will panic. use get() instead
             manager = self
                 .cvar
                 .wait_while(manager, |manager| {
-                    manager.established[&self.port].1.is_empty()
+                    manager.established[&self.port].elts.is_empty()
                 })
                 .unwrap();
         }
@@ -29,7 +30,7 @@ impl TcpListener {
             .get_mut(&self.port)
             .ok_or(Error::PortClosed(self.port))?;
 
-        let (quad, rvar, wvar) = establisheds.1.pop().unwrap();
+        let EstabElement { quad, rvar, wvar } = establisheds.elts.pop().unwrap();
 
         Ok(TcpStream {
             manager: self.manager.clone(),

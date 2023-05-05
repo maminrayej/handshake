@@ -14,12 +14,32 @@ pub use err::*;
 mod tcp;
 use tcp::{write_reset, Action, Dual, Quad, TcpListener, TCB};
 
+#[derive(Debug)]
+pub struct EstabElement {
+    quad: Quad,
+    rvar: Arc<Condvar>,
+    wvar: Arc<Condvar>,
+}
+
+#[derive(Debug)]
+pub struct EstabEntry {
+    cvar: Arc<Condvar>,
+    elts: Vec<EstabElement>,
+}
+
+#[derive(Debug)]
+pub struct StreamEntry {
+    tcb: TCB,
+    rvar: Arc<Condvar>,
+    wvar: Arc<Condvar>,
+}
+
 #[derive(Debug, Default)]
 pub struct Manager {
     bounded: HashSet<u16>,
     pending: HashMap<Quad, TCB>,
-    established: HashMap<u16, (Arc<Condvar>, Vec<(Quad, Arc<Condvar>, Arc<Condvar>)>)>,
-    streams: HashMap<Quad, (TCB, Arc<Condvar>, Arc<Condvar>)>,
+    established: HashMap<u16, EstabEntry>,
+    streams: HashMap<Quad, StreamEntry>,
 }
 
 #[derive(Debug)]
@@ -56,14 +76,17 @@ impl NetStack {
             Entry::Vacant(v) => {
                 let cvar = Arc::new(Condvar::new());
 
-                v.insert((cvar.clone(), Vec::new()));
+                v.insert(EstabEntry {
+                    cvar: cvar.clone(),
+                    elts: Vec::new(),
+                });
 
                 assert!(manager.bounded.insert(port));
 
                 return Ok(TcpListener {
                     port,
                     manager: self.manager.clone(),
-                    cvar: cvar.clone(),
+                    cvar,
                 });
             }
         }
@@ -97,7 +120,7 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
 
         let mut manager = manager.lock().unwrap();
 
-        let action = if let Some((tcb, _, _)) = manager.streams.get_mut(&quad) {
+        let action = if let Some(StreamEntry { tcb, .. }) = manager.streams.get_mut(&quad) {
             tcb.on_segment(ip4h, tcph, data, &mut tun)
         } else if let Some(tcb) = manager.pending.get_mut(&quad) {
             tcb.on_segment(ip4h, tcph, data, &mut tun)
@@ -141,12 +164,17 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                 let rvar = Arc::new(Condvar::new());
                 let wvar = Arc::new(Condvar::new());
 
-                manager
-                    .streams
-                    .insert(quad, (tcb, rvar.clone(), wvar.clone()));
+                manager.streams.insert(
+                    quad,
+                    StreamEntry {
+                        tcb,
+                        rvar: rvar.clone(),
+                        wvar: wvar.clone(),
+                    },
+                );
 
-                let (cvar, vec) = manager.established.get_mut(&dst.port).unwrap();
-                vec.push((quad, rvar, wvar));
+                let EstabEntry { cvar, elts } = manager.established.get_mut(&dst.port).unwrap();
+                elts.push(EstabElement { quad, rvar, wvar });
                 cvar.notify_one();
             }
             Action::Reset => {
@@ -155,9 +183,8 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                 manager.streams.remove(&quad).unwrap();
             }
             Action::WakeUpReader => {
-                let (_, rvar, _) = &manager.streams[&quad];
+                let StreamEntry { rvar, .. } = &manager.streams[&quad];
 
-                println!("Notifying the reader");
                 rvar.notify_one();
             }
         }

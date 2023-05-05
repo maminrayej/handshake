@@ -16,10 +16,10 @@ fn main() {
 
     let mut stream = listener.accept().unwrap();
 
-    let mut buf = [0u8; 1500];
-    let n = stream.read(&mut buf[..]).unwrap();
+    loop {
+        let mut buf = [0u8; 1500];
+        let n = stream.read(&mut buf[..]).unwrap();
 
-    println!("Data: {:?}", &buf[..n]);
-
-    netstack.join();
+        println!("{:?}", &buf[..n]);
+    }
 }

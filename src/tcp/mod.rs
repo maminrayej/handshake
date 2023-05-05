@@ -1,6 +1,7 @@
 use std::cmp;
 use std::collections::VecDeque;
 use std::net::Ipv4Addr;
+use std::time::Instant;
 
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
 
@@ -148,6 +149,22 @@ pub enum Action {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment {
+    segno: u32,
+    una: u32,
+    data: Vec<u8>,
+
+    retry: bool,
+    birth: Instant,
+}
+
+impl Segment {
+    fn end(&self) -> u32 {
+        self.segno + self.data.len() as u32 - 1
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TCB {
     pub(crate) kind: Kind,
     pub(crate) state: State,
@@ -156,8 +173,13 @@ pub struct TCB {
     pub(crate) snd: SendSpace,
     pub(crate) rcv: RecvSpace,
 
+    pub(crate) srtt: u128,
+    pub(crate) rttvar: u128,
+    pub(crate) rto: u128,
+    pub(crate) rtt_measured: bool,
+
     pub(crate) incoming: VecDeque<u8>,
-    pub(crate) outgoing: VecDeque<u8>,
+    pub(crate) outgoing: VecDeque<Segment>,
 }
 
 impl TCB {
@@ -186,6 +208,16 @@ impl TCB {
                 urp: 0,
                 irs: 0,
             },
+            srtt: 0,
+            rttvar: 0,
+            /*
+            Until a round-trip time (RTT) measurement has been made for a
+            segment sent between the sender and receiver, the sender SHOULD
+            set RTO <- 1 second, though the "backing off" on repeated
+            retransmission still applies.
+            */
+            rto: 1000,
+            rtt_measured: false,
             incoming: buf,
             outgoing: VecDeque::new(),
         }
@@ -267,7 +299,7 @@ impl TCB {
                 self.snd.wnd = tcph.window_size();
                 self.snd.nxt = self.snd.iss + 1;
 
-                self.outgoing.resize(self.snd.wnd as usize, 0);
+                self.outgoing.reserve(self.snd.wnd as usize);
 
                 self.state = State::SynRcvd;
 
@@ -567,6 +599,80 @@ impl TCB {
 
                 self.rcv.nxt = self.rcv.nxt.wrapping_add(len as u32);
                 self.rcv.wnd = self.rcv.wnd - len as u16;
+
+                let mut compute_rto = false;
+                let mut r = 0;
+                while !self.outgoing.is_empty() {
+                    let seg = self.outgoing.front_mut().unwrap();
+                    let end = seg.end();
+                    let ackno = tcph.acknowledgment_number();
+
+                    compute_rto = seg.retry == false;
+                    r = (Instant::now() - seg.birth).as_millis();
+
+                    // FIXME: These comparisons must be done in wrapping mode
+                    if ackno > end {
+                        // Full acknowledgment
+
+                        self.outgoing.pop_front();
+                    } else if seg.una < ackno && ackno <= end {
+                        // Partial acknowledgment
+
+                        seg.una = ackno;
+                    } else if seg.segno < ackno && ackno <= seg.una {
+                        // Duplicate acknowledgment
+
+                        // TODO: Probably want to inform the congestion control algorithm
+                    }
+                }
+
+                if compute_rto {
+                    /*
+                    -   When the first RTT measurement R is made, the host MUST set
+
+                            SRTT <- R
+                            RTTVAR <- R/2
+                            RTO <- SRTT + max (G, K*RTTVAR)
+
+                        where K = 4.
+
+                    -   When a subsequent RTT measurement R' is made, a host MUST set
+
+                            RTTVAR <- (1 - beta) * RTTVAR + beta * |SRTT - R'|
+                            SRTT <- (1 - alpha) * SRTT + alpha * R'
+
+                        The value of SRTT used in the update to RTTVAR is its value
+                        before updating SRTT itself using the second assignment.  That
+                        is, updating RTTVAR and SRTT MUST be computed in the above
+                        order.
+
+                        The above SHOULD be computed using alpha=1/8 and beta=1/4.
+
+                    -   After the computation, a host MUST update
+
+                            RTO <- SRTT + max (G, K*RTTVAR)
+                    */
+                    if !self.rtt_measured {
+                        self.srtt = r;
+                        self.rttvar = r / 2;
+                        self.rtt_measured = true;
+                    } else {
+                        self.rttvar = ((1.0 - 0.25) * self.rttvar as f64
+                            + 0.25 * self.srtt.abs_diff(r) as f64)
+                            as u128;
+                        self.srtt = ((1.0 - 0.125) * self.srtt as f64 + 0.125 * r as f64) as u128;
+                    }
+
+                    self.rto = self.srtt + cmp::max(100, 4 * self.rttvar);
+
+                    /*
+                    Whenever RTO is computed, if it is less than 1 second, then the
+                    RTO SHOULD be rounded up to 1 second.
+                    */
+                    self.rto = cmp::min(self.rto, 1000);
+
+                    // TODO: Manager must update RTO of this TCB in the timeout tree
+                }
 
                 write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
 
