@@ -37,6 +37,15 @@ impl TcpListener {
             quad,
             rvar,
             wvar,
+            closed: false,
         })
+    }
+}
+
+impl Drop for TcpListener {
+    fn drop(&mut self) {
+        let mut manager = self.manager.lock().unwrap();
+
+        assert!(manager.bounded.remove(&self.port));
     }
 }

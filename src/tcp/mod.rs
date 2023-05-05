@@ -1,7 +1,6 @@
 use std::cmp;
 use std::collections::VecDeque;
 use std::net::Ipv4Addr;
-use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
@@ -139,6 +138,7 @@ pub enum Kind {
     Passive,
 }
 
+// TODO: Add support for combination of actions to be returned
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Noop,
@@ -147,22 +147,19 @@ pub enum Action {
     IsEstablished,
     Reset,
     WakeUpReader,
+    DeleteTCB,
+    WakeUpWriter,
 }
 
-/*
-   una                    nxt
-    |-----------|----------|-----|
-    |     |     |
-   sno   una   sno+len-1
-*/
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
     sno: u32,
     una: u32,
     len: u32,
+    fin: bool,
 
     retry: bool,
-    birth: Instant,
+    sent: Instant,
 }
 
 impl Segment {
@@ -170,8 +167,8 @@ impl Segment {
         self.sno + self.len - 1
     }
 
-    fn unacked_len(&self) -> u32 {
-        self.end() - self.una + 1
+    fn unacked_len(&self) -> usize {
+        (self.end().wrapping_sub(self.una) + 1) as usize
     }
 }
 
@@ -181,6 +178,8 @@ pub struct TCB {
     pub(crate) kind: Kind,
     pub(crate) state: State,
     pub(crate) reset: bool,
+    pub(crate) closed: bool,
+    pub(crate) time_wait: Option<Instant>,
 
     pub(crate) snd: SendSpace,
     pub(crate) rcv: RecvSpace,
@@ -212,6 +211,8 @@ impl TCB {
             kind: Kind::Passive,
             state: State::Listen,
             reset: false,
+            closed: false,
+            time_wait: None,
             snd: SendSpace {
                 una: iss,
                 nxt: iss,
@@ -249,8 +250,8 @@ impl TCB {
             if SMSS <= 1095 bytes:
                 IW = 4 * SMSS bytes and MUST NOT be more than 4 segments
             */
-            cwnd: 3 * 1500,
-            rwnd: 0,
+            cwnd: 4 * 536,
+            rwnd: 0, // TODO: update rwnd when receiving new segments
             /*
             The initial value of ssthresh SHOULD be set arbitrarily high (e.g.,
             to the size of the largest possible advertised window), but ssthresh
@@ -269,22 +270,77 @@ impl TCB {
         self.cwnd > self.ssthresh
     }
 
-    pub fn on_tick(&mut self, tun: &mut Tun) {
-        let mut seg = self.segments.front_mut().unwrap();
+    pub fn is_outgoing_full(&self) -> bool {
+        self.outgoing.capacity() == self.outgoing.len()
+    }
 
-        let buf = Vec::from_iter(
-            self.outgoing
-                .iter()
-                .cloned()
-                .take(seg.unacked_len() as usize),
-        );
+    pub fn close(&mut self) {
+        self.closed = true;
 
-        if let Some(timeout) = self.timeout {
-            if timeout >= Instant::now() {
-                self.rto *= 2; // RTO exponential backoff
-                self.timeout = Some(Instant::now() + Duration::from_millis(self.rto as u64));
+        self.state = State::FinWait1;
+
+        let sent_len = self.snd.nxt.wrapping_sub(self.snd.una) as usize;
+        let available_len = self.outgoing.len() - sent_len;
+
+        if available_len == 0 {
+            let fin = Segment {
+                sno: self.snd.nxt,
+                una: self.snd.nxt,
+                len: 0,
+                fin: true,
+                retry: false,
+                sent: Instant::now(),
+            };
+
+            self.segments.push_back(fin);
+
+            self.snd.nxt = self.snd.nxt.wrapping_add(1);
+        }
+    }
+
+    pub fn on_tick(&mut self, tun: &mut Tun) -> Action {
+        if let Some(timeout) = self.time_wait.clone() {
+            if Instant::now() >= timeout {
+                let seg = self.segments.front_mut().unwrap();
+
+                let data: Vec<u8> = self
+                    .outgoing
+                    .iter()
+                    .cloned()
+                    .take(seg.unacked_len())
+                    .collect();
+
+                write_data(
+                    self.quad,
+                    seg.sno,
+                    self.rcv.nxt,
+                    self.rcv.wnd,
+                    tun,
+                    &data[..],
+                    seg.fin,
+                );
 
                 seg.retry = true;
+                seg.sent = Instant::now();
+
+                self.rto *= 2;
+                self.timeout = Some(seg.sent + Duration::from_millis(self.rto as u64));
+            }
+        } else if !self.outgoing.is_empty() {
+            let sent_len = self.snd.nxt.wrapping_sub(self.snd.una) as usize;
+            let available_len = self.outgoing.len() - sent_len;
+
+            if available_len > 0 {
+                let data_len = cmp::min(available_len, 536);
+                let fin = data_len == available_len && self.closed;
+
+                let data: Vec<u8> = self
+                    .outgoing
+                    .iter()
+                    .copied()
+                    .skip(sent_len)
+                    .take(data_len)
+                    .collect();
 
                 write_data(
                     self.quad,
@@ -292,26 +348,50 @@ impl TCB {
                     self.rcv.nxt,
                     self.rcv.wnd,
                     tun,
-                    &buf[..],
+                    data.as_slice(),
+                    fin,
                 );
 
-                return;
-            }
-        }
+                let seg = Segment {
+                    sno: self.snd.nxt,
+                    una: self.snd.nxt,
+                    len: data_len as u32,
+                    fin,
+                    retry: false,
+                    sent: Instant::now(),
+                };
 
-        if !self.outgoing.is_empty() {
+                self.segments.push_back(seg);
+
+                self.snd.nxt = self
+                    .snd
+                    .nxt
+                    .wrapping_add(data_len as u32)
+                    .wrapping_add(if fin { 1 } else { 0 });
+            }
+        } else if !self.segments.is_empty() {
+            let seg = self.segments.pop_front().unwrap();
+
+            assert!(self.segments.is_empty());
+            assert_eq!(seg.len, 0);
+            assert!(seg.fin);
+
             write_data(
                 self.quad,
-                self.snd.nxt,
+                seg.sno,
                 self.rcv.nxt,
                 self.rcv.wnd,
                 tun,
-                &buf[..],
+                &[],
+                seg.fin,
             );
-
-            // Reset the timer
-            self.timeout = Some(Instant::now() + Duration::from_millis(self.rto as u64));
+        } else if let Some(time_wait) = self.time_wait.clone() {
+            if time_wait >= Instant::now() {
+                return Action::DeleteTCB;
+            }
         }
+
+        Action::Noop
     }
 
     pub fn on_segment(
@@ -384,11 +464,11 @@ impl TCB {
             }
 
             if tcph.syn() {
-                self.rcv.nxt = tcph.sequence_number() + 1;
+                self.rcv.nxt = tcph.sequence_number().wrapping_add(1);
                 self.rcv.irs = tcph.sequence_number();
 
                 self.snd.wnd = tcph.window_size();
-                self.snd.nxt = self.snd.iss + 1;
+                self.snd.nxt = self.snd.iss.wrapping_add(1);
 
                 self.outgoing.reserve(self.snd.wnd as usize);
 
@@ -586,7 +666,10 @@ impl TCB {
                 } else {
                     write_reset(&ip4h, &tcph, data, tun);
                 }
-            } else if self.state == State::Estab {
+            } else if self.state == State::Estab
+                || self.state == State::FinWait1
+                || self.state == State::FinWait2
+            {
                 /*
                 ESTABLISHED STATE
                 -   If SND.UNA < SEG.ACK =< SND.NXT, then set SND.UNA <- SEG.ACK.
@@ -624,7 +707,7 @@ impl TCB {
                         During slow start, a TCP increments cwnd by at most SMSS bytes for
                         each ACK received that cumulatively acknowledges new data.
                         */
-                        self.cwnd += 1500;
+                        self.cwnd += 536;
                     } else {
                         /*
                         Another common formula that a TCP MAY use to update cwnd during
@@ -645,7 +728,7 @@ impl TCB {
                         If the above formula yields 0, the result SHOULD be rounded up to 1
                         byte.
                         */
-                        self.cwnd += cmp::max(((1500 * 1500) as f64 / self.cwnd as f64) as u32, 1);
+                        self.cwnd += cmp::max(((536 * 536) as f64 / self.cwnd as f64) as u32, 1);
                     }
 
                     let mut compute_rto = false;
@@ -656,21 +739,20 @@ impl TCB {
                         let ackno = tcph.acknowledgment_number();
 
                         compute_rto = seg.retry == false;
-                        r = (Instant::now() - seg.birth).as_millis();
+                        r = (Instant::now() - seg.sent).as_millis();
 
-                        // FIXME: These comparisons must be done in wrapping mode
-                        if ackno > end {
-                            // Full acknowledgment
-
-                            self.outgoing.pop_front();
-                        } else if seg.una < ackno && ackno <= end {
+                        if is_between_wrapped(seg.una, ackno, end.wrapping_add(1)) {
                             // Partial acknowledgment
 
-                            seg.una = ackno;
-                        } else if seg.sno < ackno && ackno <= seg.una {
-                            // Duplicate acknowledgment
+                            let acked = ackno.wrapping_sub(seg.una);
+                            self.outgoing.drain(..acked as usize);
 
-                            // TODO: Probably want to inform the congestion control algorithm
+                            seg.una = ackno;
+                        } else if wrapping_lt(end, ackno) {
+                            // Full acknowledgment
+
+                            let seg = self.segments.pop_front().unwrap();
+                            self.outgoing.drain(..seg.unacked_len());
                         }
                     }
 
@@ -719,9 +801,17 @@ impl TCB {
                         RTO SHOULD be rounded up to 1 second.
                         */
                         self.rto = cmp::min(self.rto, 1000);
-
-                        // TODO: Manager must update RTO of this TCB in the timeout tree
                     }
+
+                    if self.segments.is_empty() {
+                        self.timeout = None;
+                    } else {
+                        let seg = self.segments.front().unwrap();
+
+                        self.timeout = Some(seg.sent + Duration::from_millis(self.rto as u64));
+                    }
+
+                    return Action::WakeUpWriter;
                 } else if wrapping_lt(self.snd.nxt, tcph.acknowledgment_number()) {
                     write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
 
@@ -741,6 +831,17 @@ impl TCB {
                         self.snd.wl1 = tcph.sequence_number();
                         self.snd.wl2 = tcph.acknowledgment_number();
                     }
+                }
+            }
+
+            if self.state == State::FinWait1 {
+                if self.outgoing.is_empty()
+                    && self.segments.is_empty()
+                    && self.snd.una == self.snd.nxt
+                {
+                    self.state = State::FinWait2;
+
+                    // TODO: Wake up stream.close()
                 }
             }
 
@@ -811,6 +912,77 @@ impl TCB {
                 -   This should not occur since a FIN has been received from the
                     remote side. Ignore the segment text.
                 */
+            }
+
+            /*
+            Eighth, check the FIN bit:
+            -   Do not process the FIN if the state is CLOSED, LISTEN, or SYN-
+                SENT since the SEG.SEQ cannot be validated; drop the segment
+                and return.
+
+            -   If the FIN bit is set, signal the user "connection closing" and
+                return any pending RECEIVEs with same message, advance RCV.NXT
+                over the FIN, and send an acknowledgment for the FIN. Note that
+                FIN implies PUSH for any segment text not yet delivered to the
+                user.
+
+                SYN-RECEIVED STATE
+                ESTABLISHED STATE
+                Enter the CLOSE-WAIT state.
+
+                FIN-WAIT-1 STATE
+                If our FIN has been ACKed (perhaps in this segment), then
+                enter TIME-WAIT, start the time-wait timer, turn off the
+                other timers; otherwise, enter the CLOSING state.
+
+                FIN-WAIT-2 STATE
+                Enter the TIME-WAIT state. Start the time-wait timer,
+                turn off the other timers.
+
+                CLOSE-WAIT STATE
+                Remain in the CLOSE-WAIT state.
+
+                CLOSING STATE
+                Remain in the CLOSING state.
+
+                LAST-ACK STATE
+                Remain in the LAST-ACK state.
+
+                TIME-WAIT STATE
+                Remain in the TIME-WAIT state. Restart the 2 MSL time-
+                wait timeout.
+
+                and return.
+            */
+            if tcph.fin() {
+                if self.state == State::Listen || self.state == State::SynSent {
+                    return Action::Noop;
+                }
+
+                if self.state == State::SynRcvd || self.state == State::Estab {
+                    self.state = State::CloseWait;
+                }
+
+                if self.state == State::FinWait1 {
+                    todo!()
+                }
+
+                if self.state == State::FinWait2 {
+                    self.state = State::TimeWait;
+                    self.timeout = None;
+                    self.time_wait = Some(Instant::now() + Duration::from_secs(2 * 2 * 60));
+                }
+
+                if self.state == State::CloseWait
+                    || self.state == State::Closing
+                    || self.state == State::LastAck
+                {
+                    return Action::Noop;
+                }
+
+                if self.state == State::TimeWait {
+                    self.time_wait = Some(Instant::now() + Duration::from_secs(2 * 2 * 60));
+                }
             }
 
             todo!("Some state combination is not implemented")

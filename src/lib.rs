@@ -106,6 +106,7 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
         let mut manager = manager.lock().unwrap();
 
         for entry in manager.streams.values_mut() {
+            // TODO: Remove the entry if it returns true
             entry.tcb.on_tick(&mut tun);
         }
 
@@ -113,6 +114,7 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
         if poll(&mut pfd[..], 1).unwrap() == 0 {
             continue;
         }
+        
         let n = tun.read(&mut buf).unwrap();
 
         let Ok(ip4h) = Ipv4HeaderSlice::from_slice(&buf[..n]) else { continue };
@@ -196,6 +198,14 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                 let StreamEntry { rvar, .. } = &manager.streams[&quad];
 
                 rvar.notify_one();
+            }
+            Action::WakeUpWriter => {
+                let StreamEntry { wvar, .. } = &manager.streams[&quad];
+
+                wvar.notify_one();
+            }
+            Action::DeleteTCB => {
+                unreachable!()
             }
         }
     }

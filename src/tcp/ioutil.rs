@@ -79,7 +79,15 @@ pub fn write_ack(
     write(&ip4h, &tcph, &[], tun);
 }
 
-pub fn write_data(quad: Quad, sqno: u32, ackno: u32, wnd: u16, tun: &mut Tun, data: &[u8]) {
+pub fn write_data(
+    quad: Quad,
+    sqno: u32,
+    ackno: u32,
+    wnd: u16,
+    tun: &mut Tun,
+    data: &[u8],
+    fin: bool,
+) {
     let mut tcph = TcpHeader::new(quad.dst.port, quad.src.port, sqno, 1024);
 
     let ip4h = Ipv4Header::new(
@@ -93,6 +101,7 @@ pub fn write_data(quad: Quad, sqno: u32, ackno: u32, wnd: u16, tun: &mut Tun, da
     tcph.ack = true;
     tcph.acknowledgment_number = ackno;
     tcph.window_size = wnd;
+    tcph.fin = fin;
     tcph.checksum = tcph.calc_checksum_ipv4(&ip4h, &[]).unwrap();
 
     write(&ip4h, &tcph, data, tun);
