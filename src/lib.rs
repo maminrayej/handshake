@@ -2,10 +2,12 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::Ipv4Addr;
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
+use nix::poll::{poll, PollFd, PollFlags};
 use tidy_tuntap::Tun;
 
 mod err;
@@ -101,6 +103,16 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
     loop {
         let mut buf = [0u8; 1500];
 
+        let mut manager = manager.lock().unwrap();
+
+        for entry in manager.streams.values_mut() {
+            entry.tcb.on_tick(&mut tun);
+        }
+
+        let mut pfd = [PollFd::new(tun.as_raw_fd(), PollFlags::POLLIN)];
+        if poll(&mut pfd[..], 1).unwrap() == 0 {
+            continue;
+        }
         let n = tun.read(&mut buf).unwrap();
 
         let Ok(ip4h) = Ipv4HeaderSlice::from_slice(&buf[..n]) else { continue };
@@ -118,14 +130,12 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
 
         let quad = Quad { src, dst };
 
-        let mut manager = manager.lock().unwrap();
-
         let action = if let Some(StreamEntry { tcb, .. }) = manager.streams.get_mut(&quad) {
             tcb.on_segment(ip4h, tcph, data, &mut tun)
         } else if let Some(tcb) = manager.pending.get_mut(&quad) {
             tcb.on_segment(ip4h, tcph, data, &mut tun)
         } else if manager.bounded.contains(&dst.port) {
-            let mut tcb = TCB::listen();
+            let mut tcb = TCB::listen(quad);
 
             tcb.on_segment(ip4h, tcph, data, &mut tun)
         } else {

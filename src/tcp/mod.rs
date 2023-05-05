@@ -1,7 +1,8 @@
 use std::cmp;
 use std::collections::VecDeque;
 use std::net::Ipv4Addr;
-use std::time::Instant;
+use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
 
@@ -168,10 +169,15 @@ impl Segment {
     fn end(&self) -> u32 {
         self.sno + self.len - 1
     }
+
+    fn unacked_len(&self) -> u32 {
+        self.end() - self.una + 1
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TCB {
+    pub(crate) quad: Quad,
     pub(crate) kind: Kind,
     pub(crate) state: State,
     pub(crate) reset: bool,
@@ -183,6 +189,7 @@ pub struct TCB {
     pub(crate) rttvar: u128,
     pub(crate) rto: u128,
     pub(crate) rtt_measured: bool,
+    pub(crate) timeout: Option<Instant>,
 
     pub(crate) cwnd: u32,
     pub(crate) rwnd: u32,
@@ -194,13 +201,14 @@ pub struct TCB {
 }
 
 impl TCB {
-    pub fn listen() -> Self {
+    pub fn listen(quad: Quad) -> Self {
         // TODO: Choose a random initial sequence number
         let iss = 0;
 
         let buf = VecDeque::with_capacity(64240);
 
         TCB {
+            quad,
             kind: Kind::Passive,
             state: State::Listen,
             reset: false,
@@ -229,6 +237,7 @@ impl TCB {
             */
             rto: 1000,
             rtt_measured: false,
+            timeout: None,
             /*
             IW, the initial value of cwnd, MUST be set using the following
             guidelines as an upper bound.
@@ -258,6 +267,51 @@ impl TCB {
 
     pub fn is_slow_start(&self) -> bool {
         self.cwnd > self.ssthresh
+    }
+
+    pub fn on_tick(&mut self, tun: &mut Tun) {
+        let mut seg = self.segments.front_mut().unwrap();
+
+        let buf = Vec::from_iter(
+            self.outgoing
+                .iter()
+                .cloned()
+                .take(seg.unacked_len() as usize),
+        );
+
+        if let Some(timeout) = self.timeout {
+            if timeout >= Instant::now() {
+                self.rto *= 2; // RTO exponential backoff
+                self.timeout = Some(Instant::now() + Duration::from_millis(self.rto as u64));
+
+                seg.retry = true;
+
+                write_data(
+                    self.quad,
+                    self.snd.nxt,
+                    self.rcv.nxt,
+                    self.rcv.wnd,
+                    tun,
+                    &buf[..],
+                );
+
+                return;
+            }
+        }
+
+        if !self.outgoing.is_empty() {
+            write_data(
+                self.quad,
+                self.snd.nxt,
+                self.rcv.nxt,
+                self.rcv.wnd,
+                tun,
+                &buf[..],
+            );
+
+            // Reset the timer
+            self.timeout = Some(Instant::now() + Duration::from_millis(self.rto as u64));
+        }
     }
 
     pub fn on_segment(
