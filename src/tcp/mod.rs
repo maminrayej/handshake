@@ -129,12 +129,14 @@ pub enum Action {
     AddToPending(TCB),
     RemoveFromPending,
     IsEstablished,
+    Reset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TCB {
     pub(crate) kind: Kind,
     pub(crate) state: State,
+    pub(crate) reset: bool,
 
     pub(crate) snd: SendSpace,
     pub(crate) rcv: RecvSpace,
@@ -148,6 +150,7 @@ impl TCB {
         TCB {
             kind: Kind::Passive,
             state: State::Listen,
+            reset: false,
             snd: SendSpace {
                 una: iss,
                 nxt: iss,
@@ -283,41 +286,117 @@ impl TCB {
 
             // Second, check the RST bit
             if tcph.rst() {
-                /*
-                SYN-RECEIVED STATE
-                    If the RST bit is set,
-                        If this connection was initiated with a passive OPEN
-                        (i.e., came from the LISTEN state), then return this
-                        connection to LISTEN state and return. The user need not
-                        be informed. If this connection was initiated with an
-                        active OPEN (i.e., came from SYN-SENT state), then the
-                        connection was refused; signal the user "connection
-                        refused". In either case, the retransmission queue should
-                        be flushed. And in the active OPEN case, enter the CLOSED
-                        state and delete the TCB, and return.
-                 */
                 if self.state == State::SynRcvd {
+                    /*
+                    SYN-RECEIVED STATE
+                        If the RST bit is set,
+                            If this connection was initiated with a passive OPEN
+                            (i.e., came from the LISTEN state), then return this
+                            connection to LISTEN state and return. The user need not
+                            be informed. If this connection was initiated with an
+                            active OPEN (i.e., came from SYN-SENT state), then the
+                            connection was refused; signal the user "connection
+                            refused". In either case, the retransmission queue should
+                            be flushed. And in the active OPEN case, enter the CLOSED
+                            state and delete the TCB, and return.
+                    */
+
                     if self.kind == Kind::Passive {
                         return Action::RemoveFromPending;
                     } else {
                         // TODO: Inform the user that connection has been refused.
                     }
+                } else if self.state == State::Estab
+                    || self.state == State::FinWait1
+                    || self.state == State::FinWait2
+                    || self.state == State::CloseWait
+                {
+                    /*
+                    ESTABLISHED STATE
+                    FIN-WAIT-1 STATE
+                    FIN-WAIT-2 STATE
+                    CLOSE-WAIT STATE
+                        If the RST bit is set, then any outstanding RECEIVEs and
+                        SEND should receive "reset" responses. All segment queues
+                        should be flushed. Users should also receive an unsolicited
+                        general "connection reset" signal. Enter the CLOSED state,
+                        delete the TCB, and return.
+                    */
+
+                    self.reset = true;
+                    return Action::Reset;
                 }
             }
 
             // Fourth, check the SYN bit:
             if tcph.syn() {
-                /*
-                SYN-RECEIVED STATE
-                    If the connection was initiated with a passive OPEN, then
-                    return this connection to the LISTEN state and return.
-                    Otherwise, handle per the directions for synchronized states
-                    below.
-                 */
                 if self.state == State::SynRcvd {
+                    /*
+                    SYN-RECEIVED STATE
+                        If the connection was initiated with a passive OPEN, then
+                        return this connection to the LISTEN state and return.
+                        Otherwise, handle per the directions for synchronized states
+                        below.
+                    */
+
                     if self.kind == Kind::Passive {
                         return Action::RemoveFromPending;
                     }
+                } else if self.state == State::Estab
+                    || self.state == State::FinWait1
+                    || self.state == State::FinWait2
+                    || self.state == State::CloseWait
+                    || self.state == State::Closing
+                    || self.state == State::LastAck
+                    || self.state == State::TimeWait
+                {
+                    /*
+                    ESTABLISHED STATE
+                    FIN-WAIT-1 STATE
+                    FIN-WAIT-2 STATE
+                    CLOSE-WAIT STATE
+                    CLOSING STATE
+                    LAST-ACK STATE
+                    TIME-WAIT STATE
+                    -   If the SYN bit is set in these synchronized states, it may
+                        be either a legitimate new connection attempt (e.g., in the
+                        case of TIME-WAIT), an error where the connection should be
+                        reset, or the result of an attack attempt, as described in
+                        RFC 5961 [9]. For the TIME-WAIT state, new connections can
+                        be accepted if the Timestamp Option is used and meets
+                        expectations (per [40]). For all other cases, RFC 5961
+                        provides a mitigation with applicability to some situations,
+                        though there are also alternatives that offer cryptographic
+                        protection (see Section 7). RFC 5961 recommends that in
+                        these synchronized states, if the SYN bit is set,
+                        irrespective of the sequence number, TCP endpoints MUST send
+                        a "challenge ACK" to the remote peer:
+
+                            <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+
+                    -   After sending the acknowledgment, TCP implementations MUST
+                        drop the unacceptable segment and stop processing further.
+                        Note that RFC 5961 and Errata ID 4772 [99] contain
+                        additional ACK throttling notes for an implementation.
+
+                    -   For implementations that do not follow RFC 5961, the
+                        original behavior described in RFC 793 follows in this
+                        paragraph. If the SYN is in the window it is an error: send
+                        a reset, any outstanding RECEIVEs and SEND should receive
+                        "reset" responses, all segment queues should be flushed, the
+                        user should also receive an unsolicited general "connection
+                        reset" signal, enter the CLOSED state, delete the TCB, and
+                        return.
+
+                    -   If the SYN is not in the window, this step would not be
+                        reached and an ACK would have been sent in the first step
+                        (sequence number check).
+                    */
+
+                    // TODO: For now we don't implement RFC 5961 so we just send a reset.
+                    write_reset(&ip4h, &tcph, data, tun);
+
+                    return Action::Reset;
                 }
             }
 
@@ -327,23 +406,24 @@ impl TCB {
                 return Action::Noop;
             }
 
-            /*
-            SYN-RECEIVED STATE
-                If SND.UNA < SEG.ACK =< SND.NXT, then enter ESTABLISHED
-                state and continue processing with the variables below
-                set to:
-
-                    SND.WND <- SEG.WND
-                    SND.WL1 <- SEG.SEQ
-                    SND.WL2 <- SEG.ACK
-
-                If the segment acknowledgment is not acceptable, form a reset segment
-
-                    <SEQ=SEG.ACK><CTL=RST>
-
-                and send it.
-            */
             if self.state == State::SynRcvd {
+                /*
+                SYN-RECEIVED STATE
+                    -   If SND.UNA < SEG.ACK =< SND.NXT, then enter ESTABLISHED
+                        state and continue processing with the variables below
+                        set to:
+
+                            SND.WND <- SEG.WND
+                            SND.WL1 <- SEG.SEQ
+                            SND.WL2 <- SEG.ACK
+
+                    -   If the segment acknowledgment is not acceptable, form a reset segment
+
+                            <SEQ=SEG.ACK><CTL=RST>
+
+                        and send it.
+                */
+
                 if is_between_wrapped(
                     self.snd.una,
                     tcph.acknowledgment_number(),
@@ -358,6 +438,59 @@ impl TCB {
                     return Action::IsEstablished;
                 } else {
                     write_reset(&ip4h, &tcph, data, tun);
+                }
+            } else if self.state == State::Estab {
+                /*
+                ESTABLISHED STATE
+                -   If SND.UNA < SEG.ACK =< SND.NXT, then set SND.UNA <- SEG.ACK.
+                    Any segments on the retransmission queue that
+                    are thereby entirely acknowledged are removed. Users
+                    should receive positive acknowledgments for buffers that
+                    have been SENT and fully acknowledged (i.e., SEND buffer
+                    should be returned with "ok" response). If the ACK is a
+                    duplicate (SEG.ACK =< SND.UNA), it can be ignored. If the
+                    ACK acks something not yet sent (SEG.ACK > SND.NXT), then
+                    send an ACK, drop the segment, and return.
+
+                -   If SND.UNA =< SEG.ACK =< SND.NXT, the send window should
+                    be updated. If (SND.WL1 < SEG.SEQ or (SND.WL1 = SEG.SEQ
+                    and SND.WL2 =< SEG.ACK)), set SND.WND <- SEG.WND, set
+                    SND.WL1 <- SEG.SEQ, and set SND.WL2 <- SEG.ACK.
+
+                -   Note that SND.WND is an offset from SND.UNA, that SND.WL1
+                    records the sequence number of the last segment used to
+                    update SND.WND, and that SND.WL2 records the
+                    acknowledgment number of the last segment used to update
+                    SND.WND. The check here prevents using old segments to
+                    update the window.
+                */
+
+                if is_between_wrapped(
+                    self.snd.una,
+                    tcph.acknowledgment_number(),
+                    self.snd.nxt.wrapping_add(1),
+                ) {
+                    self.snd.una = tcph.acknowledgment_number();
+                    // TODO: Remove acked buffers from retransmission queue
+                } else if wrapping_lt(self.snd.nxt, tcph.acknowledgment_number()) {
+                    write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, tun);
+
+                    return Action::Noop;
+                }
+
+                if is_between_wrapped(
+                    self.snd.una.wrapping_sub(1),
+                    tcph.acknowledgment_number(),
+                    self.snd.nxt.wrapping_add(1),
+                ) {
+                    if wrapping_lt(self.snd.wl1, tcph.sequence_number())
+                        || (self.snd.wl1 == tcph.sequence_number()
+                            && wrapping_lt(self.snd.wl2, tcph.sequence_number().wrapping_add(1)))
+                    {
+                        self.snd.wnd = tcph.window_size();
+                        self.snd.wl1 = tcph.sequence_number();
+                        self.snd.wl2 = tcph.acknowledgment_number();
+                    }
                 }
             }
 
@@ -421,7 +554,7 @@ fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
     //     insure that new data is never mistakenly considered old and vice-
     //     versa, the left edge of the sender's window has to be at most
     //     2**31 away from the right edge of the receiver's window.
-    lhs.wrapping_sub(rhs) > 2 ^ 31
+    lhs.wrapping_sub(rhs) > (1 << 31)
 }
 
 fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {

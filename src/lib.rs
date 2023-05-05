@@ -145,6 +145,11 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) {
                 vec.push(quad);
                 cvar.notify_one();
             }
+            Action::Reset => {
+                // TODO: Signal any read() or write() that the connection has been reset.
+
+                manager.streams.remove(&quad).unwrap();
+            }
         }
     }
 }
