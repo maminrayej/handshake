@@ -136,7 +136,7 @@ impl Write for TcpStream {
             .tcb
             .outgoing;
 
-        let len = cmp::min(buf.len(), outgoing.capacity());
+        let len = cmp::min(buf.len(), outgoing.capacity() - outgoing.len());
 
         outgoing.extend(buf[..len].iter());
 

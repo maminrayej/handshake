@@ -75,7 +75,7 @@ impl NetStack {
             thread::spawn(move || loop {
                 thread::sleep(Duration::from_millis(4));
 
-                iss.store(iss.load(Ordering::Acquire), Ordering::Release);
+                iss.fetch_add(1, Ordering::Release);
             })
         };
 

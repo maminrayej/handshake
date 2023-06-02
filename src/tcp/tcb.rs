@@ -212,8 +212,6 @@ pub struct TCB {
 
 impl TCB {
     pub fn listen(quad: Quad, iss: u32) -> Self {
-        let buf = VecDeque::with_capacity(64240);
-
         TCB {
             quad,
             kind: Kind::Passive,
@@ -229,12 +227,12 @@ impl TCB {
                 wl1: 0,
                 wl2: 0,
                 iss,
-                mss: 0,
+                mss: 536,
                 max_wnd: 0,
             },
             rcv: RecvSpace {
                 nxt: 0,
-                wnd: buf.capacity() as u16,
+                wnd: 64240,
                 urp: 0,
                 irs: 0,
                 mss: 536,
@@ -277,7 +275,7 @@ impl TCB {
 
             probe_timeout: None,
 
-            incoming: buf,
+            incoming: VecDeque::new(),
             outgoing: VecDeque::new(),
             segments: VecDeque::new(),
         }
@@ -867,6 +865,8 @@ impl TCB {
 
                 self.state = State::SynRcvd;
 
+                self.timeout = Some(Instant::now() + Duration::from_millis(self.rto as u64));
+
                 return Action::AddToPending(self.clone());
             }
 
@@ -1062,6 +1062,7 @@ impl TCB {
                     }
 
                     self.outgoing.reserve_exact(self.snd.wnd as usize);
+                    self.incoming.reserve_exact(64240);
 
                     return Action::IsEstablished;
                 } else {
@@ -1198,7 +1199,7 @@ impl TCB {
             */
             if self.state == State::FinWait2 {
                 /*
-                Our FIN has been acke so there are no other segment
+                Our FIN has been acked so there are no other segment
                 to be retransmitted.
                 */
 
