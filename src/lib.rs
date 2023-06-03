@@ -136,9 +136,11 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
 
         let mut to_be_deleted = vec![];
         for (quad, entry) in manager.streams.iter_mut() {
+            println!("On tick stream quad: {:?}", quad);
             if entry.tcb.on_tick(&mut tun) {
                 to_be_deleted.push(*quad);
             }
+            println!("----------------------------------------------");
         }
         for quad in to_be_deleted {
             manager.streams.remove(&quad).unwrap();
@@ -146,9 +148,11 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
 
         let mut to_be_deleted = vec![];
         for (quad, tcb) in manager.pending.iter_mut() {
+            println!("On tick pending quad: {:?}", quad);
             if tcb.on_tick(&mut tun) {
                 to_be_deleted.push(*quad);
             }
+            println!("----------------------------------------------");
         }
         for quad in to_be_deleted {
             manager.streams.remove(&quad).unwrap();
@@ -156,6 +160,9 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
 
         let mut pfd = [PollFd::new(tun.as_raw_fd(), PollFlags::POLLIN)];
         if poll(&mut pfd[..], 1).unwrap() == 0 {
+            drop(manager);
+            thread::sleep(Duration::from_millis(250));
+
             continue;
         }
 
@@ -177,14 +184,18 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
         let quad = Quad { src, dst };
 
         let action = if let Some(StreamEntry { tcb, .. }) = manager.streams.get_mut(&quad) {
+            println!("Process stream quad: {:?}", quad);
             tcb.on_segment(ip4h, tcph, data, &mut tun)
         } else if let Some(tcb) = manager.pending.get_mut(&quad) {
+            println!("Process pending quad: {:?}", quad);
             tcb.on_segment(ip4h, tcph, data, &mut tun)
         } else if manager.bounded.contains(&dst.port) {
+            println!("Process bounded quad: {:?}", quad);
             let mut tcb = TCB::listen(quad, manager.iss.load(Ordering::Acquire));
 
             tcb.on_segment(ip4h, tcph, data, &mut tun)
         } else {
+            println!("Invalid quad: {:?}", quad);
             /*
             If the connection does not exist (CLOSED), then a reset is sent
             in response to any incoming segment except another reset. A SYN
@@ -207,8 +218,9 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
             Action::Noop
         };
 
+        println!("\nDoing action: {:?}", action);
         match action {
-            Action::Noop => continue,
+            Action::Noop => {}
             Action::AddToPending(tcb) => {
                 manager.pending.insert(quad, tcb);
             }
@@ -217,6 +229,7 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
             }
             Action::IsEstablished => {
                 let tcb = manager.pending.remove(&quad).unwrap();
+
                 let rvar = Arc::new(Condvar::new());
                 let wvar = Arc::new(Condvar::new());
                 let svar = Arc::new(Condvar::new());
@@ -265,12 +278,15 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                 } = &manager.streams[&quad];
 
                 if wake_up_reader {
+                    println!("Noifying reader");
                     rvar.notify_one();
                 }
                 if wake_up_writer {
+                    println!("Noifying writer");
                     wvar.notify_one();
                 }
                 if wake_up_closer {
+                    println!("Noifying closer");
                     svar.notify_one();
                 }
             }
@@ -281,5 +297,6 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                 todo!()
             }
         }
+        println!("----------------------------------------------");
     }
 }

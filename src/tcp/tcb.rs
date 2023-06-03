@@ -165,7 +165,7 @@ pub struct Segment {
 
     retry: bool,
     total_ret_time: u128,
-    sent: Instant,
+    sent: Option<Instant>,
 }
 
 impl Segment {
@@ -173,8 +173,8 @@ impl Segment {
         self.sno.wrapping_add(self.len).wrapping_sub(1)
     }
 
-    fn unacked_len(&self) -> usize {
-        (self.end().wrapping_sub(self.una) + 1) as usize
+    fn unacked_data_len(&self) -> usize {
+        (self.end().wrapping_sub(self.una) + 1) as usize - if self.fin { 1 } else { 0 }
     }
 }
 
@@ -363,12 +363,12 @@ impl TCB {
             let fin = Segment {
                 sno: self.snd.nxt,
                 una: self.snd.nxt,
-                len: 0,
+                len: 1,
                 fin: true,
                 syn: false,
                 retry: false,
                 total_ret_time: 0,
-                sent: Instant::now(),
+                sent: None,
             };
 
             self.segments.push_back(fin);
@@ -444,15 +444,17 @@ impl TCB {
     }
 
     pub fn on_tick(&mut self, tun: &mut Tun) -> bool {
+        println!("\ton_tick");
         if let Some(timeout) = self.timeout.clone() {
             if Instant::now() >= timeout {
+                println!("\t\ttimeout");
                 let seg = self.segments.front_mut().unwrap();
 
                 let data: Vec<u8> = self
                     .outgoing
                     .iter()
                     .cloned()
-                    .take(seg.unacked_len())
+                    .take(seg.unacked_data_len())
                     .collect();
 
                 write_data(
@@ -468,10 +470,11 @@ impl TCB {
 
                 seg.retry = true;
                 seg.total_ret_time += self.rto;
-                seg.sent = Instant::now();
+                seg.sent = Some(Instant::now());
 
                 self.rto *= 2;
-                self.timeout = Some(seg.sent + Duration::from_millis(self.rto as u64));
+                self.timeout =
+                    Some(seg.sent.clone().unwrap() + Duration::from_millis(self.rto as u64));
 
                 /*
                         RFC 9293 S3.8.3. TCP Connection Failures
@@ -536,7 +539,10 @@ impl TCB {
                     }
                 }
             }
-        } else if !self.outgoing.is_empty() {
+        }
+
+        if !self.outgoing.is_empty() {
+            println!("\t\tOutgoing");
             if self.sws_allows_send() {
                 let sent_len = self.snd.nxt.wrapping_sub(self.snd.una) as usize;
                 let available_len = self.outgoing.len() - sent_len;
@@ -577,7 +583,7 @@ impl TCB {
                         syn: false,
                         retry: false,
                         total_ret_time: 0,
-                        sent: Instant::now(),
+                        sent: Some(Instant::now()),
                     };
 
                     self.segments.push_back(seg);
@@ -590,23 +596,41 @@ impl TCB {
                 }
             }
         } else if !self.segments.is_empty() {
-            let seg = self.segments.front().unwrap();
+            let seg = self.segments.front_mut().unwrap();
 
-            write_data(
-                self.quad,
-                seg.sno,
-                self.rcv.nxt,
-                self.rcv.wnd,
-                tun,
-                &[],
-                seg.fin,
-                seg.syn,
-            );
-        } else if let Some(time_wait) = self.time_wait.clone() {
+            if seg.sent.is_none() {
+                println!("\t\tSegment");
+
+                write_data(
+                    self.quad,
+                    seg.sno,
+                    self.rcv.nxt,
+                    self.rcv.wnd,
+                    tun,
+                    &[],
+                    seg.fin,
+                    seg.syn,
+                );
+
+                seg.sent = Some(Instant::now());
+
+                if self.timeout.is_none() {
+                    self.timeout =
+                        Some(seg.sent.clone().unwrap() + Duration::from_millis(self.rto as u64));
+                    println!("\t\tSetting timeout: {}ms", self.rto);
+                }
+            }
+        }
+
+        if let Some(time_wait) = self.time_wait.clone() {
+            println!("\t\tTimewait");
             if time_wait >= Instant::now() {
                 return true;
             }
-        } else if let Some(probe_timeout) = self.probe_timeout.clone() {
+        }
+
+        if let Some(probe_timeout) = self.probe_timeout.clone() {
+            println!("\t\tProbe");
             /*
                     RFC 9293 S3.8.6.1. Zero-Window Probing
 
@@ -658,6 +682,7 @@ impl TCB {
     }
 
     fn process_ack(&mut self, ackno: u32) -> Option<u128> {
+        println!("\t\tProcess Ack");
         let mut compute_rto = false;
         let mut r = 0;
 
@@ -666,9 +691,10 @@ impl TCB {
             let end = seg.end();
 
             compute_rto = seg.retry == false;
-            r = (Instant::now() - seg.sent).as_millis();
+            r = (Instant::now() - seg.sent.clone().unwrap()).as_millis();
 
             if is_between_wrapped(seg.una, ackno, end.wrapping_add(1)) {
+                println!("\t\t\tPartial ack");
                 // Partial acknowledgment
 
                 let acked = ackno.wrapping_sub(seg.una);
@@ -676,10 +702,11 @@ impl TCB {
 
                 seg.una = ackno;
             } else if wrapping_lt(end, ackno) {
+                println!("\t\t\tFull ack");
                 // Full acknowledgment
 
                 let seg = self.segments.pop_front().unwrap();
-                self.outgoing.drain(..seg.unacked_len());
+                self.outgoing.drain(..seg.unacked_data_len());
             }
         }
 
@@ -687,12 +714,16 @@ impl TCB {
     }
 
     fn congestion_control(&mut self) {
+        println!(
+            "\t\tCongestion Control: snd.mss: {}, cwnd: {}, ssthresh: {}",
+            self.snd.mss, self.cwnd, self.ssthresh
+        );
         if self.is_slow_start() {
             /*
             During slow start, a TCP increments cwnd by at most SMSS bytes for
             each ACK received that cumulatively acknowledges new data.
             */
-            self.cwnd += self.rcv.mss as u32;
+            self.cwnd += self.snd.mss as u32;
         } else {
             /*
             Another common formula that a TCP MAY use to update cwnd during
@@ -713,14 +744,16 @@ impl TCB {
             If the above formula yields 0, the result SHOULD be rounded up to 1
             byte.
             */
+
             self.cwnd += cmp::max(
-                ((self.rcv.mss * self.rcv.mss) as f64 / self.cwnd as f64) as u32,
+                ((self.snd.mss as f64 * self.snd.mss as f64) / self.cwnd as f64) as u32,
                 1,
             );
         }
     }
 
     fn compute_rto(&mut self, r: u128) {
+        println!("\t\tCompute RTO");
         /*
         -   When the first RTT measurement R is made, the host MUST set
 
@@ -772,6 +805,7 @@ impl TCB {
         data: &[u8],
         tun: &mut Tun,
     ) -> Action {
+        println!("\tOn Segment: {:?}", self.state);
         if self.state == State::Listen {
             /*
             If the state is LISTEN, then
@@ -853,19 +887,17 @@ impl TCB {
                 self.segments.push_front(Segment {
                     sno: self.snd.nxt,
                     una: self.snd.nxt,
-                    len: 0,
+                    len: 1,
                     fin: false,
                     syn: true,
                     retry: false,
                     total_ret_time: 0,
-                    sent: Instant::now(),
+                    sent: None,
                 });
 
                 self.snd.nxt = self.snd.iss.wrapping_add(1);
 
                 self.state = State::SynRcvd;
-
-                self.timeout = Some(Instant::now() + Duration::from_millis(self.rto as u64));
 
                 return Action::AddToPending(self.clone());
             }
@@ -1064,6 +1096,12 @@ impl TCB {
                     self.outgoing.reserve_exact(self.snd.wnd as usize);
                     self.incoming.reserve_exact(64240);
 
+                    // Pop the syn segment and turn off its timer
+                    self.segments.pop_front().unwrap();
+                    assert!(self.segments.is_empty());
+
+                    self.timeout.take();
+
                     return Action::IsEstablished;
                 } else {
                     write_reset(&ip4h, &tcph, data, tun);
@@ -1121,7 +1159,9 @@ impl TCB {
                     } else {
                         let seg = self.segments.front().unwrap();
 
-                        self.timeout = Some(seg.sent + Duration::from_millis(self.rto as u64));
+                        self.timeout = Some(
+                            seg.sent.clone().unwrap() + Duration::from_millis(self.rto as u64),
+                        );
                     }
 
                     wake_up_writer = true;
@@ -1251,15 +1291,17 @@ impl TCB {
 
                 let data = &data[new..new + len];
 
-                self.incoming.extend(data.iter());
+                if data.len() != 0 {
+                    self.incoming.extend(data.iter());
 
-                self.rcv.nxt = self.rcv.nxt.wrapping_add(len as u32);
+                    self.rcv.nxt = self.rcv.nxt.wrapping_add(len as u32);
 
-                self.rcv.wnd = self.rcv.wnd - len as u16;
+                    self.rcv.wnd = self.rcv.wnd - len as u16;
 
-                write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
+                    write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
 
-                wake_up_reader = true;
+                    wake_up_reader = true;
+                }
             } else if self.state == State::CloseWait
                 || self.state == State::Closing
                 || self.state == State::LastAck

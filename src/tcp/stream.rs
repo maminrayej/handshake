@@ -65,7 +65,7 @@ impl Read for TcpStream {
                 .rvar
                 .wait_while(manager, |manager| {
                     manager.streams[&self.quad].tcb.incoming.is_empty()
-                        || !self.reset.load(Ordering::Acquire)
+                        && !self.reset.load(Ordering::Acquire)
                 })
                 .unwrap();
         }
@@ -117,7 +117,7 @@ impl Write for TcpStream {
                 .wvar
                 .wait_while(manager, |manager| {
                     manager.streams[&self.quad].tcb.is_outgoing_full()
-                        || !self.reset.load(Ordering::Acquire)
+                        && !self.reset.load(Ordering::Acquire)
                 })
                 .unwrap();
         }
@@ -158,7 +158,7 @@ impl Write for TcpStream {
                 .wvar
                 .wait_while(manager, |manager| {
                     !manager.streams[&self.quad].tcb.outgoing.is_empty()
-                        || !self.reset.load(Ordering::Acquire)
+                        && !self.reset.load(Ordering::Acquire)
                 })
                 .unwrap();
         }
@@ -178,6 +178,16 @@ impl Write for TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        self.close();
+        let mut manager = self.manager.lock().unwrap();
+
+        if !self.closed {
+            self.closed = true;
+
+            manager.streams.get_mut(&self.quad).unwrap().tcb.close();
+
+            manager = self.svar.wait(manager).unwrap();
+        }
+
+        manager.streams.remove(&self.quad).unwrap();
     }
 }
