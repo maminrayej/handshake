@@ -353,9 +353,12 @@ impl TCB {
             .wrapping_add(self.snd.wnd as u32)
             .wrapping_sub(self.snd.nxt) as usize;
 
-        cmp::min(d, u) >= self.snd.mss as usize
+        let can_send = cmp::min(d, u) >= self.snd.mss as usize
             || d <= u
-            || cmp::min(d, u) >= (0.5 * self.snd.max_wnd as f64) as usize
+            || cmp::min(d, u) >= (0.5 * self.snd.max_wnd as f64) as usize;
+
+        println!("\t\t\tSWS: {can_send}");
+        can_send
     }
 
     pub fn close(&mut self) {
@@ -567,9 +570,13 @@ impl TCB {
                     cmp::min(available_len, self.cwnd as usize),
                     self.snd.wnd as usize,
                 );
+                println!("\t\t\tsent_len: {sent_len}");
+                println!("\t\t\tto_be_sent: {to_be_sent}");
+                println!("\t\t\tavailable_len: {available_len}");
 
                 if to_be_sent > 0 {
                     let data_len = cmp::min(to_be_sent, self.snd.mss as usize);
+                    println!("\t\t\tData len: {data_len}");
                     let fin = data_len == to_be_sent && self.write_closed.load(Ordering::Acquire);
 
                     let data: Vec<u8> = self
@@ -579,6 +586,7 @@ impl TCB {
                         .skip(sent_len)
                         .take(data_len)
                         .collect();
+                    println!("\t\t\tData: {data:?}");
 
                     write_data(
                         self.quad,

@@ -68,10 +68,10 @@ pub fn write_data(
     fin: bool,
     syn: bool,
 ) {
-    let mut tcph = TcpHeader::new(quad.dst.port, quad.src.port, sqno, 1024);
+    let mut tcph = TcpHeader::new(quad.dst.port, quad.src.port, sqno, wnd);
 
     let ip4h = Ipv4Header::new(
-        tcph.header_len(),
+        tcph.header_len() + data.len() as u16,
         32,
         6,
         quad.dst.ipv4.octets(),
@@ -83,7 +83,7 @@ pub fn write_data(
     tcph.window_size = wnd;
     tcph.fin = fin;
     tcph.syn = syn;
-    tcph.checksum = tcph.calc_checksum_ipv4(&ip4h, &[]).unwrap();
+    tcph.checksum = tcph.calc_checksum_ipv4(&ip4h, data).unwrap();
 
     write(&ip4h, &tcph, data, tun);
 }
