@@ -1,8 +1,8 @@
 use std::cmp;
 use std::collections::VecDeque;
 use std::net::Ipv4Addr;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::Acquire;
+use std::sync::atomic::Ordering::{self, Acquire};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -183,8 +183,9 @@ pub struct TCB {
     pub(crate) quad: Quad,
     pub(crate) kind: Kind,
     pub(crate) state: State,
-    pub(crate) reset: bool,
-    pub(crate) closed: bool,
+    pub(crate) reset: Arc<AtomicBool>,
+    pub(crate) write_closed: Arc<AtomicBool>,
+    pub(crate) read_closed: Arc<AtomicBool>,
     pub(crate) time_wait: Option<Instant>,
 
     pub(crate) snd: SendSpace,
@@ -216,8 +217,9 @@ impl TCB {
             quad,
             kind: Kind::Passive,
             state: State::Listen,
-            reset: false,
-            closed: false,
+            reset: Arc::new(AtomicBool::new(false)),
+            write_closed: Arc::new(AtomicBool::new(false)),
+            read_closed: Arc::new(AtomicBool::new(false)),
             time_wait: None,
             snd: SendSpace {
                 una: iss,
@@ -290,10 +292,18 @@ impl TCB {
     }
 
     fn is_fin_acked(&self) -> bool {
+        println!(
+            "\t\tIs FIN acked: {}",
+            self.outgoing.is_empty()
+                && self.segments.is_empty()
+                && self.snd.una == self.snd.nxt
+                && self.write_closed.load(Ordering::Acquire)
+        );
+
         self.outgoing.is_empty()
             && self.segments.is_empty()
             && self.snd.una == self.snd.nxt
-            && self.closed
+            && self.write_closed.load(Ordering::Acquire)
     }
 
     fn available_data_len(&self) -> usize {
@@ -349,9 +359,15 @@ impl TCB {
     }
 
     pub fn close(&mut self) {
-        self.closed = true;
+        if self.state == State::Estab {
+            println!("\t\tState <- FinWait1");
+            self.state = State::FinWait1;
+        } else {
+            assert_eq!(self.state, State::CloseWait);
 
-        self.state = State::FinWait1;
+            println!("\t\tState <- LastAck");
+            self.state = State::LastAck;
+        }
 
         /*
         When we close the write half of the TCP stream, we must send a FIN.
@@ -554,7 +570,7 @@ impl TCB {
 
                 if to_be_sent > 0 {
                     let data_len = cmp::min(to_be_sent, self.snd.mss as usize);
-                    let fin = data_len == to_be_sent && self.closed;
+                    let fin = data_len == to_be_sent && self.write_closed.load(Ordering::Acquire);
 
                     let data: Vec<u8> = self
                         .outgoing
@@ -681,10 +697,14 @@ impl TCB {
         false
     }
 
-    fn process_ack(&mut self, ackno: u32) -> Option<u128> {
+    fn process_ack(&mut self, ackno: u32) -> (bool, Option<u128>) {
         println!("\t\tProcess Ack");
+        self.snd.una = ackno;
+
         let mut compute_rto = false;
         let mut r = 0;
+
+        let before_len = self.outgoing.len();
 
         while !self.segments.is_empty() {
             let seg = self.segments.front_mut().unwrap();
@@ -710,7 +730,15 @@ impl TCB {
             }
         }
 
-        compute_rto.then_some(r)
+        if self.segments.is_empty() {
+            self.timeout = None;
+        } else {
+            let seg = self.segments.front().unwrap();
+
+            self.timeout = Some(seg.sent.clone().unwrap() + Duration::from_millis(self.rto as u64));
+        }
+
+        (before_len < self.outgoing.len(), compute_rto.then_some(r))
     }
 
     fn congestion_control(&mut self) {
@@ -897,6 +925,7 @@ impl TCB {
 
                 self.snd.nxt = self.snd.iss.wrapping_add(1);
 
+                println!("\t\tState <- SynRcvd");
                 self.state = State::SynRcvd;
 
                 return Action::AddToPending(self.clone());
@@ -927,6 +956,7 @@ impl TCB {
                     return Action::Noop;
                 }
 
+                println!("\t\tSegment invalid");
                 write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
 
                 // After sending the acknowledgment, drop the unacceptable
@@ -973,7 +1003,7 @@ impl TCB {
                         delete the TCB, and return.
                     */
 
-                    self.reset = true;
+                    self.reset.store(true, Ordering::Release);
                     return Action::Reset;
                 }
             }
@@ -1083,6 +1113,7 @@ impl TCB {
                     tcph.acknowledgment_number(),
                     self.snd.nxt.wrapping_add(1),
                 ) {
+                    println!("\t\tState <- Estab");
                     self.state = State::Estab;
 
                     self.snd.wnd = tcph.window_size();
@@ -1144,28 +1175,17 @@ impl TCB {
                     tcph.acknowledgment_number(),
                     self.snd.nxt.wrapping_add(1),
                 ) {
-                    self.snd.una = tcph.acknowledgment_number();
-
                     self.congestion_control();
 
-                    let r = self.process_ack(tcph.acknowledgment_number());
+                    let (can_write, r) = self.process_ack(tcph.acknowledgment_number());
 
                     if let Some(r) = r {
                         self.compute_rto(r);
                     }
 
-                    if self.segments.is_empty() {
-                        self.timeout = None;
-                    } else {
-                        let seg = self.segments.front().unwrap();
-
-                        self.timeout = Some(
-                            seg.sent.clone().unwrap() + Duration::from_millis(self.rto as u64),
-                        );
-                    }
-
-                    wake_up_writer = true;
+                    wake_up_writer = can_write;
                 } else if wrapping_lt(self.snd.nxt, tcph.acknowledgment_number()) {
+                    println!("\t\tInvalid Ack");
                     write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
 
                     return Action::Noop;
@@ -1218,6 +1238,7 @@ impl TCB {
 
                 self.time_wait = Some(Instant::now() + Duration::from_secs(2 * 2 * 60));
 
+                println!("\tAck retransmitted fin");
                 write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
             }
 
@@ -1228,6 +1249,7 @@ impl TCB {
             */
             if self.state == State::FinWait1 {
                 if self.is_fin_acked() {
+                    println!("\t\tState <- FinWait2");
                     self.state = State::FinWait2;
                 }
             }
@@ -1246,11 +1268,14 @@ impl TCB {
                 wake_up_closer = true;
             }
 
+            let mut process_fin = tcph.fin();
+
             // Seventh, process the segment text:
             if self.state == State::Estab
                 || self.state == State::FinWait1
                 || self.state == State::FinWait2
             {
+                println!("\tProcess segment data");
                 /*
                 ESTABLISHED STATE
                 FIN-WAIT-1 STATE
@@ -1286,22 +1311,27 @@ impl TCB {
                 */
 
                 let new = (self.rcv.nxt.wrapping_sub(tcph.sequence_number())) as usize;
-                let len = data.len() - new;
-                let len = cmp::min(len, self.rcv.wnd as usize);
+                let new_len = data.len() - new;
+                let acc_len = cmp::min(new_len, self.rcv.wnd as usize);
 
-                let data = &data[new..new + len];
+                let data = &data[new..new + acc_len];
 
-                if data.len() != 0 {
-                    self.incoming.extend(data.iter());
+                process_fin &= new_len == acc_len;
 
-                    self.rcv.nxt = self.rcv.nxt.wrapping_add(len as u32);
+                self.incoming.extend(data.iter());
 
-                    self.rcv.wnd = self.rcv.wnd - len as u16;
+                self.rcv.nxt = self
+                    .rcv
+                    .nxt
+                    .wrapping_add(acc_len as u32)
+                    .wrapping_add(if process_fin { 1 } else { 0 });
 
-                    write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
+                self.rcv.wnd = self.rcv.wnd - acc_len as u16;
 
-                    wake_up_reader = true;
-                }
+                println!("\tAck data");
+                write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
+
+                wake_up_reader = !data.is_empty();
             } else if self.state == State::CloseWait
                 || self.state == State::Closing
                 || self.state == State::LastAck
@@ -1358,39 +1388,36 @@ impl TCB {
 
                 and return.
             */
-            if tcph.fin() {
+            if process_fin {
+                println!("\t\tProcessing FIN");
                 if self.state == State::Listen || self.state == State::SynSent {
                     return Action::Noop;
-                }
-
-                if self.state == State::SynRcvd || self.state == State::Estab {
+                } else if self.state == State::SynRcvd || self.state == State::Estab {
+                    println!("\t\tState <- CloseWait");
                     self.state = State::CloseWait;
-                }
-
-                if self.state == State::FinWait1 {
+                    self.read_closed.store(true, Ordering::Release);
+                    wake_up_reader = true;
+                } else if self.state == State::FinWait1 {
                     if self.is_fin_acked() {
+                        println!("\t\tState <- TimeWait");
                         self.state = State::TimeWait;
                         self.timeout = None;
                         self.time_wait = Some(Instant::now() + Duration::from_secs(2 * 2 * 60));
                     } else {
+                        println!("\t\tState <- Closing");
                         self.state = State::Closing;
                     }
-                }
-
-                if self.state == State::FinWait2 {
+                } else if self.state == State::FinWait2 {
+                    println!("\t\tState <- TimeWait");
                     self.state = State::TimeWait;
                     self.timeout = None;
                     self.time_wait = Some(Instant::now() + Duration::from_secs(2 * 2 * 60));
-                }
-
-                if self.state == State::CloseWait
+                } else if self.state == State::CloseWait
                     || self.state == State::Closing
                     || self.state == State::LastAck
                 {
                     return Action::Noop;
-                }
-
-                if self.state == State::TimeWait {
+                } else if self.state == State::TimeWait {
                     self.time_wait = Some(Instant::now() + Duration::from_secs(2 * 2 * 60));
                 }
             }

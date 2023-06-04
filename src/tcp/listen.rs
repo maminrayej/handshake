@@ -36,6 +36,8 @@ impl TcpListener {
             svar,
             r2,
             r2_syn,
+            write_closed,
+            read_closed,
             reset,
         } = establisheds.elts.pop().unwrap();
 
@@ -47,7 +49,8 @@ impl TcpListener {
             svar,
             r2,
             r2_syn,
-            closed: false,
+            write_closed,
+            read_closed,
             reset,
         })
     }

@@ -16,7 +16,8 @@ pub struct TcpStream {
     pub(crate) svar: Arc<Condvar>,
     pub(crate) r2_syn: Arc<AtomicU64>,
     pub(crate) r2: Arc<AtomicU64>,
-    pub(crate) closed: bool,
+    pub(crate) write_closed: Arc<AtomicBool>,
+    pub(crate) read_closed: Arc<AtomicBool>,
     pub(crate) reset: Arc<AtomicBool>,
 }
 
@@ -24,7 +25,7 @@ impl TcpStream {
     pub fn close(&mut self) {
         let mut manager = self.manager.lock().unwrap();
 
-        self.closed = true;
+        self.write_closed.store(true, Ordering::Release);
 
         manager.streams.get_mut(&self.quad).unwrap().tcb.close();
 
@@ -61,11 +62,16 @@ impl Read for TcpStream {
             .incoming
             .is_empty()
         {
+            if self.read_closed.load(Ordering::Acquire) {
+                return Ok(0);
+            }
+
             manager = self
                 .rvar
                 .wait_while(manager, |manager| {
                     manager.streams[&self.quad].tcb.incoming.is_empty()
                         && !self.reset.load(Ordering::Acquire)
+                        && !self.read_closed.load(Ordering::Acquire)
                 })
                 .unwrap();
         }
@@ -75,6 +81,10 @@ impl Read for TcpStream {
                 io::ErrorKind::ConnectionReset,
                 "Connection has been reset",
             ));
+        }
+
+        if self.read_closed.load(Ordering::Acquire) {
+            return Ok(0);
         }
 
         let len = manager
@@ -90,7 +100,7 @@ impl Read for TcpStream {
 
 impl Write for TcpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.closed {
+        if self.write_closed.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "Write half of the stream is closed",
@@ -180,8 +190,8 @@ impl Drop for TcpStream {
     fn drop(&mut self) {
         let mut manager = self.manager.lock().unwrap();
 
-        if !self.closed {
-            self.closed = true;
+        if !self.write_closed.load(Ordering::Acquire) {
+            self.write_closed.store(true, Ordering::Release);
 
             manager.streams.get_mut(&self.quad).unwrap().tcb.close();
 

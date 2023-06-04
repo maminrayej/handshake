@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
@@ -18,16 +18,15 @@ fn main() {
     let mut stream = listener.accept().unwrap();
     println!(">>> Connection accepted");
 
-    let mut total = 0;
     loop {
-        if total >= 2 {
-            break;
-        }
-
         let mut buf = [0u8; 1500];
         let n = stream.read(&mut buf[..]).unwrap();
 
-        total += n;
+        if n == 0 {
+            break;
+        }
+
+        stream.write(&buf[..n]).unwrap();
 
         println!(
             "\n>>> Read: {:?}\n",

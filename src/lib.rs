@@ -26,6 +26,8 @@ pub struct EstabElement {
     svar: Arc<Condvar>,
     r2_syn: Arc<AtomicU64>,
     r2: Arc<AtomicU64>,
+    write_closed: Arc<AtomicBool>,
+    read_closed: Arc<AtomicBool>,
     reset: Arc<AtomicBool>,
 }
 
@@ -41,7 +43,6 @@ pub struct StreamEntry {
     rvar: Arc<Condvar>,
     wvar: Arc<Condvar>,
     svar: Arc<Condvar>,
-    reset: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Default)]
@@ -235,7 +236,10 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                 let svar = Arc::new(Condvar::new());
                 let r2 = tcb.r2.clone();
                 let r2_syn = tcb.r2_syn.clone();
-                let reset = Arc::new(AtomicBool::new(false));
+
+                let reset = tcb.reset.clone();
+                let read_closed = tcb.read_closed.clone();
+                let write_closed = tcb.write_closed.clone();
 
                 manager.streams.insert(
                     quad,
@@ -244,7 +248,6 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                         rvar: rvar.clone(),
                         wvar: wvar.clone(),
                         svar: svar.clone(),
-                        reset: reset.clone(),
                     },
                 );
 
@@ -256,6 +259,8 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                     svar,
                     r2,
                     r2_syn,
+                    write_closed,
+                    read_closed,
                     reset,
                 });
                 cvar.notify_one();
@@ -263,7 +268,6 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
             Action::Reset => {
                 let stream = manager.streams.remove(&quad).unwrap();
 
-                stream.reset.store(true, Ordering::Release);
                 stream.rvar.notify_one();
                 stream.wvar.notify_one();
                 stream.svar.notify_one();
@@ -291,7 +295,7 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                 }
             }
             Action::DeleteTCB => {
-                todo!()
+                manager.streams.remove(&quad).unwrap();
             }
             Action::ConnectionRefused => {
                 todo!()
