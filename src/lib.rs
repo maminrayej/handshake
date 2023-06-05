@@ -16,7 +16,7 @@ mod err;
 pub use err::*;
 
 mod tcp;
-use tcp::{write_reset, Action, Dual, Quad, TcpListener, TCB};
+use tcp::{write_reset, Action, Dual, Quad, TcpListener, TcpStream, TCB};
 
 #[derive(Debug)]
 pub struct EstabElement {
@@ -56,6 +56,7 @@ pub struct Manager {
 
 #[derive(Debug)]
 pub struct NetStack {
+    addr: Ipv4Addr,
     manager: Arc<Mutex<Manager>>,
     jh: thread::JoinHandle<()>,
     ih: thread::JoinHandle<()>,
@@ -94,7 +95,12 @@ impl NetStack {
             thread::spawn(move || segment_loop(tun, manager.clone()))
         };
 
-        Ok(NetStack { manager, jh, ih })
+        Ok(NetStack {
+            addr,
+            manager,
+            jh,
+            ih,
+        })
     }
 
     pub fn bind(&mut self, port: u16) -> Result<TcpListener, Error> {
@@ -121,6 +127,75 @@ impl NetStack {
                 });
             }
         }
+    }
+
+    pub fn connect(&mut self, addr: Ipv4Addr, port: u16) -> Result<TcpStream, Error> {
+        let mut manager = self.manager.lock().unwrap();
+
+        let local_port = manager.bounded.iter().max().copied().unwrap_or(4000) + 1;
+
+        assert!(manager.bounded.insert(local_port));
+
+        let quad = Quad {
+            src: Dual {
+                ipv4: self.addr,
+                port: local_port,
+            },
+            dst: Dual { ipv4: addr, port },
+        };
+
+        let tcb = TCB::syn_sent(quad, manager.iss.load(Ordering::Acquire));
+
+        manager.pending.insert(quad, tcb);
+
+        let cvar = Arc::new(Condvar::new());
+
+        manager.established.insert(
+            local_port,
+            EstabEntry {
+                cvar: cvar.clone(),
+                elts: Vec::new(),
+            },
+        );
+
+        // Wait for it to reach established state
+        if manager.established[&local_port].elts.is_empty() {
+            manager = cvar
+                .wait_while(manager, |manager| {
+                    manager.established[&local_port].elts.is_empty()
+                })
+                .unwrap();
+        }
+
+        let establisheds = manager
+            .established
+            .get_mut(&local_port)
+            .ok_or(Error::PortClosed(local_port))?;
+
+        let EstabElement {
+            quad,
+            rvar,
+            wvar,
+            svar,
+            r2,
+            r2_syn,
+            write_closed,
+            read_closed,
+            reset,
+        } = establisheds.elts.pop().unwrap();
+
+        Ok(TcpStream {
+            manager: self.manager.clone(),
+            quad,
+            rvar,
+            wvar,
+            svar,
+            r2,
+            r2_syn,
+            write_closed,
+            read_closed,
+            reset,
+        })
     }
 
     pub fn join(self) {
@@ -170,12 +245,12 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
         let data = &buf[(ip4h.ihl() * 4 + tcph.data_offset() * 4) as usize..n];
 
         let src = Dual {
-            ipv4: ip4h.source_addr(),
-            port: tcph.source_port(),
-        };
-        let dst = Dual {
             ipv4: ip4h.destination_addr(),
             port: tcph.destination_port(),
+        };
+        let dst = Dual {
+            ipv4: ip4h.source_addr(),
+            port: tcph.source_port(),
         };
 
         let quad = Quad { src, dst };
@@ -186,7 +261,7 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
         } else if let Some(tcb) = manager.pending.get_mut(&quad) {
             println!("Process pending quad: {:?}", quad);
             tcb.on_segment(ip4h, tcph, data, &mut tun)
-        } else if manager.bounded.contains(&dst.port) {
+        } else if manager.bounded.contains(&src.port) {
             println!("Process bounded quad: {:?}", quad);
             let mut tcb = TCB::listen(quad, manager.iss.load(Ordering::Acquire));
 
@@ -247,7 +322,7 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                     },
                 );
 
-                let EstabEntry { cvar, elts } = manager.established.get_mut(&dst.port).unwrap();
+                let EstabEntry { cvar, elts } = manager.established.get_mut(&src.port).unwrap();
                 elts.push(EstabElement {
                     quad,
                     rvar,

@@ -135,7 +135,7 @@ pub struct RecvSpace {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    _Active,
+    Active,
     Passive,
 }
 
@@ -162,10 +162,12 @@ pub struct Segment {
     len: u32,
     fin: bool,
     syn: bool,
+    ack: bool,
 
     retry: bool,
     total_ret_time: u128,
     sent: Option<Instant>,
+    mss: Option<u16>,
 }
 
 impl Segment {
@@ -283,6 +285,94 @@ impl TCB {
         }
     }
 
+    pub fn syn_sent(quad: Quad, iss: u32) -> Self {
+        let mut tcb = TCB {
+            quad,
+            kind: Kind::Active,
+            state: State::SynSent,
+            reset: Arc::new(AtomicBool::new(false)),
+            write_closed: Arc::new(AtomicBool::new(false)),
+            read_closed: Arc::new(AtomicBool::new(false)),
+            time_wait: None,
+            snd: SendSpace {
+                una: iss,
+                nxt: iss,
+                wnd: 0,
+                urp: 0,
+                wl1: 0,
+                wl2: 0,
+                iss,
+                mss: 536,
+                max_wnd: 0,
+            },
+            rcv: RecvSpace {
+                nxt: 0,
+                wnd: 64240,
+                urp: 0,
+                irs: 0,
+                mss: 536,
+            },
+            srtt: 0,
+            rttvar: 0,
+            /*
+            Until a round-trip time (RTT) measurement has been made for a
+            segment sent between the sender and receiver, the sender SHOULD
+            set RTO <- 1 second, though the "backing off" on repeated
+            retransmission still applies.
+            */
+            rto: 1000,
+            rtt_measured: false,
+            timeout: None,
+            r1: 50 * 1000,
+            r2: Arc::new(AtomicU64::new(100 * 1000)),
+            r1_syn: 1 * 60 * 1000,
+            r2_syn: Arc::new(AtomicU64::new(3 * 60 * 1000)),
+            /*
+            IW, the initial value of cwnd, MUST be set using the following
+            guidelines as an upper bound.
+
+            If SMSS > 2190 bytes:
+                IW = 2 * SMSS bytes and MUST NOT be more than 2 segments
+            If (SMSS > 1095 bytes) and (SMSS <= 2190 bytes):
+                IW = 3 * SMSS bytes and MUST NOT be more than 3 segments
+            if SMSS <= 1095 bytes:
+                IW = 4 * SMSS bytes and MUST NOT be more than 4 segments
+            */
+            cwnd: 4 * 536,
+            /*
+            The initial value of ssthresh SHOULD be set arbitrarily high (e.g.,
+            to the size of the largest possible advertised window), but ssthresh
+            MUST be reduced in response to congestion.  Setting ssthresh as high
+            as possible allows the network conditions, rather than some arbitrary
+            host limit, to dictate the sending rate.
+            */
+            ssthresh: u32::MAX,
+
+            probe_timeout: None,
+
+            incoming: VecDeque::new(),
+            outgoing: VecDeque::new(),
+            segments: VecDeque::new(),
+        };
+
+        tcb.segments.push_front(Segment {
+            sno: tcb.snd.nxt,
+            una: tcb.snd.nxt,
+            len: 1,
+            fin: false,
+            syn: true,
+            ack: false,
+            retry: false,
+            total_ret_time: 0,
+            sent: None,
+            mss: Some(tcb.rcv.mss),
+        });
+
+        tcb.snd.nxt = tcb.snd.iss.wrapping_add(1);
+
+        tcb
+    }
+
     fn is_slow_start(&self) -> bool {
         self.cwnd < self.ssthresh
     }
@@ -382,9 +472,11 @@ impl TCB {
                 len: 1,
                 fin: true,
                 syn: false,
+                ack: true,
                 retry: false,
                 total_ret_time: 0,
                 sent: None,
+                mss: None,
             };
 
             self.segments.push_back(fin);
@@ -473,10 +565,11 @@ impl TCB {
                     .collect();
 
                 println!(
-                    "\t\t\tWriting {}bytes with flags: FIN: {}, SYN: {}",
+                    "\t\t\tWriting {}bytes with flags: FIN: {}, SYN: {}, ACK: {}",
                     data.len(),
                     seg.fin,
-                    seg.syn
+                    seg.syn,
+                    seg.ack
                 );
                 write_data(
                     self.quad,
@@ -487,6 +580,8 @@ impl TCB {
                     &data[..],
                     seg.fin,
                     seg.syn,
+                    seg.ack,
+                    seg.mss,
                 );
 
                 seg.retry = true;
@@ -605,6 +700,8 @@ impl TCB {
                         data.as_slice(),
                         fin,
                         false,
+                        true,
+                        None,
                     );
 
                     let seg = Segment {
@@ -613,9 +710,11 @@ impl TCB {
                         len: data_len as u32,
                         fin,
                         syn: false,
+                        ack: true,
                         retry: false,
                         total_ret_time: 0,
                         sent: Some(Instant::now()),
+                        mss: None,
                     };
 
                     self.timeout =
@@ -637,8 +736,8 @@ impl TCB {
                 println!("\t\tSegment");
 
                 println!(
-                    "\t\t\tWriting segment with flags: FIN: {}, SYN: {}",
-                    seg.fin, seg.syn
+                    "\t\t\tWriting segment with flags: FIN: {}, SYN: {}, ACK: {}",
+                    seg.fin, seg.syn, seg.ack,
                 );
                 write_data(
                     self.quad,
@@ -649,6 +748,8 @@ impl TCB {
                     &[],
                     seg.fin,
                     seg.syn,
+                    seg.ack,
+                    seg.mss,
                 );
 
                 seg.sent = Some(Instant::now());
@@ -713,6 +814,8 @@ impl TCB {
                     &[0u8; 8],
                     false,
                     false,
+                    true,
+                    None,
                 );
 
                 self.probe_timeout = Some(Instant::now() + Duration::from_millis(self.rto as u64));
@@ -951,9 +1054,11 @@ impl TCB {
                     len: 1,
                     fin: false,
                     syn: true,
+                    ack: true,
                     retry: false,
                     total_ret_time: 0,
                     sent: None,
+                    mss: None,
                 });
 
                 self.snd.nxt = self.snd.iss.wrapping_add(1);
@@ -962,6 +1067,111 @@ impl TCB {
                 self.state = State::SynRcvd;
 
                 return Action::AddToPending(self.clone());
+            }
+
+            return Action::Noop;
+        } else if self.state == State::SynSent {
+            /*
+            If the state is SYN-SENT, then
+
+            First, check the ACK bit:
+
+            If the ACK bit is set,
+
+            If SEG.ACK =< ISS or SEG.ACK > SND.NXT, send a reset (unless the RST bit is set, if so drop the segment and return)
+            <SEQ=SEG.ACK><CTL=RST>
+            and discard the segment. Return. If SND.UNA < SEG.ACK =< SND.NXT, then the ACK is acceptable. Some deployed TCP code has used the check SEG.ACK == SND.NXT (using "==" rather than "=<"), but this is not appropriate when the stack is capable of sending data on the SYN because the TCP peer may not accept and acknowledge all of the data on the SYN.
+
+            Second, check the RST bit:
+
+            If the RST bit is set,
+            A potential blind reset attack is described in RFC 5961 [9]. The mitigation described in that document has specific applicability explained therein, and is not a substitute for cryptographic protection (e.g., IPsec or TCP-AO). A TCP implementation that supports the mitigation described in RFC 5961 SHOULD first check that the sequence number exactly matches RCV.NXT prior to executing the action in the next paragraph.
+            If the ACK was acceptable, then signal to the user "error: connection reset", drop the segment, enter CLOSED state, delete TCB, and return. Otherwise (no ACK), drop the segment and return.
+
+            Third, check the security:
+
+            If the security/compartment in the segment does not exactly match the security/compartment in the TCB, send a reset:
+
+            If there is an ACK,
+            <SEQ=SEG.ACK><CTL=RST>
+
+            Otherwise,
+            <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>
+            If a reset was sent, discard the segment and return.
+
+            Fourth, check the SYN bit:
+            This step should be reached only if the ACK is ok, or there is no ACK, and the segment did not contain a RST.
+            If the SYN bit is on and the security/compartment is acceptable, then RCV.NXT is set to SEG.SEQ+1, IRS is set to SEG.SEQ. SND.UNA should be advanced to equal SEG.ACK (if there is an ACK), and any segments on the retransmission queue that are thereby acknowledged should be removed.
+
+            If SND.UNA > ISS (our SYN has been ACKed), change the connection state to ESTABLISHED, form an ACK segment
+            <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+            and send it. Data or controls that were queued for transmission MAY be included. Some TCP implementations suppress sending this segment when the received segment contains data that will anyways generate an acknowledgment in the later processing steps, saving this extra acknowledgment of the SYN from being sent. If there are other controls or text in the segment, then continue processing at the sixth step under Section 3.10.7.4 where the URG bit is checked; otherwise, return.
+
+            Otherwise, enter SYN-RECEIVED, form a SYN,ACK segment
+            <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>
+
+            and send it. Set the variables:
+
+            SND.WND <- SEG.WND
+            SND.WL1 <- SEG.SEQ SND.WL2 <- SEG.ACK If there are other controls or text in the segment, queue them for processing after the ESTABLISHED state has been reached, return.
+            Note that it is legal to send and receive application data on SYN segments (this is the "text in the segment" mentioned above). There has been significant misinformation and misunderstanding of this topic historically. Some firewalls and security devices consider this suspicious. However, the capability was used in T/TCP [21] and is used in TCP Fast Open (TFO) [48], so is important for implementations and network devices to permit.
+
+            Fifth, if neither of the SYN or RST bits is set, then drop the segment and return.
+            */
+            if tcph.ack() {
+                if is_between_wrapped(
+                    self.snd.una,
+                    tcph.acknowledgment_number(),
+                    self.snd.nxt.wrapping_add(1),
+                ) {
+                    if tcph.rst() {
+                        return Action::Reset;
+                    }
+                } else {
+                    write_reset(&ip4h, &tcph, &[], tun);
+
+                    return Action::Noop;
+                }
+            }
+
+            if tcph.syn() {
+                self.rcv.nxt = tcph.sequence_number().wrapping_add(1);
+                self.rcv.irs = tcph.sequence_number();
+                self.snd.una = tcph.acknowledgment_number();
+
+                // Our syn is acked
+                if wrapping_lt(self.snd.iss, self.snd.una) {
+                    self.snd.wnd = tcph.window_size();
+                    self.snd.wl1 = tcph.sequence_number();
+                    self.snd.wl2 = tcph.acknowledgment_number();
+
+                    if self.snd.wnd > self.snd.max_wnd {
+                        self.snd.max_wnd = self.snd.wnd;
+                    }
+
+                    self.outgoing.reserve_exact(self.snd.wnd as usize);
+                    self.incoming.reserve_exact(64240);
+
+                    // Pop the syn segment and turn off its timer
+                    self.segments.pop_front().unwrap();
+                    assert!(self.segments.is_empty());
+
+                    self.timeout.take();
+
+                    println!("\t\tState <- Estab");
+                    self.state = State::Estab;
+
+                    write_ack(&self.quad, self.snd.nxt, self.rcv.nxt, self.snd.wnd, tun);
+
+                    return Action::IsEstablished;
+                } else {
+                    println!("\t\tState <- SynRcvd");
+                    self.state = State::SynRcvd;
+
+                    write_synack(&self.quad, self.snd.nxt, self.rcv.nxt, self.snd.wnd, tun);
+
+                    return Action::Noop;
+                }
             }
 
             return Action::Noop;
@@ -990,7 +1200,7 @@ impl TCB {
                 }
 
                 println!("\t\tSegment invalid");
-                write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
+                write_ack(&self.quad, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
 
                 // After sending the acknowledgment, drop the unacceptable
                 // segment and return.
@@ -1140,7 +1350,6 @@ impl TCB {
 
                         and send it.
                 */
-
                 if is_between_wrapped(
                     self.snd.una,
                     tcph.acknowledgment_number(),
@@ -1219,7 +1428,7 @@ impl TCB {
                     wake_up_writer = can_write;
                 } else if wrapping_lt(self.snd.nxt, tcph.acknowledgment_number()) {
                     println!("\t\tInvalid Ack");
-                    write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
+                    write_ack(&self.quad, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
 
                     return Action::Noop;
                 }
@@ -1272,7 +1481,7 @@ impl TCB {
                 self.time_wait = Some(Instant::now() + Duration::from_secs(2 * 2 * 60));
 
                 println!("\tAck retransmitted fin");
-                write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
+                write_ack(&self.quad, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
             }
 
             /*
@@ -1366,7 +1575,7 @@ impl TCB {
                 // Only ack if accepted new data, or the window was zero and this is a probe segment
                 if wrapping_lt(pre_nxt, self.rcv.nxt) || pre_wnd == 0 {
                     println!("\tAck data");
-                    write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
+                    write_ack(&self.quad, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
                 }
 
                 wake_up_reader = !data.is_empty();
