@@ -5,7 +5,16 @@ use tidy_tuntap::Tun;
 
 use super::Quad;
 
+const FAIL_PROB: f64 = 0.5;
+
 fn write(ip4h: &Ipv4Header, tcph: &TcpHeader, data: &[u8], tun: &mut Tun) {
+    // Drop the segment randomly
+    if rand::random::<f64>() < FAIL_PROB {
+        println!("\t\t\t!!!Segment is dropped!!!");
+
+        return;
+    }
+
     let mut cursor = Cursor::new([0u8; 1500]);
     ip4h.write(&mut cursor).unwrap();
     tcph.write(&mut cursor).unwrap();

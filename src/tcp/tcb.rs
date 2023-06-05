@@ -284,7 +284,7 @@ impl TCB {
     }
 
     fn is_slow_start(&self) -> bool {
-        self.cwnd > self.ssthresh
+        self.cwnd < self.ssthresh
     }
 
     pub fn is_outgoing_full(&self) -> bool {
@@ -353,12 +353,9 @@ impl TCB {
             .wrapping_add(self.snd.wnd as u32)
             .wrapping_sub(self.snd.nxt) as usize;
 
-        let can_send = cmp::min(d, u) >= self.snd.mss as usize
+        cmp::min(d, u) >= self.snd.mss as usize
             || d <= u
-            || cmp::min(d, u) >= (0.5 * self.snd.max_wnd as f64) as usize;
-
-        println!("\t\t\tSWS: {can_send}");
-        can_send
+            || cmp::min(d, u) >= (0.5 * self.snd.max_wnd as f64) as usize
     }
 
     pub fn close(&mut self) {
@@ -463,10 +460,9 @@ impl TCB {
     }
 
     pub fn on_tick(&mut self, tun: &mut Tun) -> bool {
-        println!("\ton_tick");
         if let Some(timeout) = self.timeout.clone() {
             if Instant::now() >= timeout {
-                println!("\t\ttimeout");
+                println!("\t\tTimeout");
                 let seg = self.segments.front_mut().unwrap();
 
                 let data: Vec<u8> = self
@@ -476,6 +472,12 @@ impl TCB {
                     .take(seg.unacked_data_len())
                     .collect();
 
+                println!(
+                    "\t\t\tWriting {}bytes with flags: FIN: {}, SYN: {}",
+                    data.len(),
+                    seg.fin,
+                    seg.syn
+                );
                 write_data(
                     self.quad,
                     seg.sno,
@@ -491,7 +493,10 @@ impl TCB {
                 seg.total_ret_time += self.rto;
                 seg.sent = Some(Instant::now());
 
+                println!("\t\t\tBefore RTO: {}", self.rto);
                 self.rto *= 2;
+                println!("\t\t\tAfter RTO: {}", self.rto);
+
                 self.timeout =
                     Some(seg.sent.clone().unwrap() + Duration::from_millis(self.rto as u64));
 
@@ -546,14 +551,16 @@ impl TCB {
                 */
                 if seg.syn {
                     if seg.total_ret_time > self.r1_syn {
-                        println!("Threshold Syn-R1 reached for {:?}", self.quad);
+                        println!("\t\t\tThreshold Syn-R1 reached");
                     } else if seg.total_ret_time as u64 > self.r2_syn.load(Acquire) {
+                        println!("\t\t\tThreshold Syn-R2 reached. Terminating connection.");
                         return true;
                     }
                 } else {
                     if seg.total_ret_time > self.r1 {
-                        println!("Threshold R1 reached for {:?}", self.quad);
+                        println!("\t\t\tThreshold R1 reached for {:?}", self.quad);
                     } else if seg.total_ret_time as u64 > self.r2.load(Acquire) {
+                        println!("\t\t\tThreshold R2 reached. Terminating connection.");
                         return true;
                     }
                 }
@@ -561,7 +568,6 @@ impl TCB {
         }
 
         if !self.outgoing.is_empty() {
-            println!("\t\tOutgoing");
             if self.sws_allows_send() {
                 let sent_len = self.snd.nxt.wrapping_sub(self.snd.una) as usize;
                 let available_len = self.outgoing.len() - sent_len;
@@ -570,11 +576,13 @@ impl TCB {
                     cmp::min(available_len, self.cwnd as usize),
                     self.snd.wnd as usize,
                 );
-                println!("\t\t\tsent_len: {sent_len}");
-                println!("\t\t\tto_be_sent: {to_be_sent}");
-                println!("\t\t\tavailable_len: {available_len}");
 
                 if to_be_sent > 0 {
+                    println!("\t\tOutgoing");
+                    println!("\t\t\tsent_len: {sent_len}");
+                    println!("\t\t\tto_be_sent: {to_be_sent}");
+                    println!("\t\t\tavailable_len: {available_len}");
+
                     let data_len = cmp::min(to_be_sent, self.snd.mss as usize);
                     println!("\t\t\tData len: {data_len}");
                     let fin = data_len == to_be_sent && self.write_closed.load(Ordering::Acquire);
@@ -586,8 +594,8 @@ impl TCB {
                         .skip(sent_len)
                         .take(data_len)
                         .collect();
-                    println!("\t\t\tData: {data:?}");
 
+                    println!("\t\t\tWriting {}bytes with flags: FIN: {}", data.len(), fin,);
                     write_data(
                         self.quad,
                         self.snd.nxt,
@@ -610,6 +618,9 @@ impl TCB {
                         sent: Some(Instant::now()),
                     };
 
+                    self.timeout =
+                        Some(seg.sent.clone().unwrap() + Duration::from_millis(self.rto as u64));
+
                     self.segments.push_back(seg);
 
                     self.snd.nxt = self
@@ -625,6 +636,10 @@ impl TCB {
             if seg.sent.is_none() {
                 println!("\t\tSegment");
 
+                println!(
+                    "\t\t\tWriting segment with flags: FIN: {}, SYN: {}",
+                    seg.fin, seg.syn
+                );
                 write_data(
                     self.quad,
                     seg.sno,
@@ -641,7 +656,7 @@ impl TCB {
                 if self.timeout.is_none() {
                     self.timeout =
                         Some(seg.sent.clone().unwrap() + Duration::from_millis(self.rto as u64));
-                    println!("\t\tSetting timeout: {}ms", self.rto);
+                    println!("\t\t\tSetting timeout: {}ms", self.rto);
                 }
             }
         }
@@ -649,6 +664,7 @@ impl TCB {
         if let Some(time_wait) = self.time_wait.clone() {
             println!("\t\tTimewait");
             if time_wait >= Instant::now() {
+                println!("\t\t\tTimewait reached, deleting TCB");
                 return true;
             }
         }
@@ -687,6 +703,7 @@ impl TCB {
             interval between successive probes (SHLD-30).
             */
             if probe_timeout >= Instant::now() {
+                println!("\t\t\tWriting data to probe zero window");
                 write_data(
                     self.quad,
                     self.snd.una.wrapping_sub(1),
@@ -739,6 +756,7 @@ impl TCB {
         }
 
         if self.segments.is_empty() {
+            println!("\t\t\tNo more segments, turning off timer");
             self.timeout = None;
         } else {
             let seg = self.segments.front().unwrap();
@@ -746,6 +764,11 @@ impl TCB {
             self.timeout = Some(seg.sent.clone().unwrap() + Duration::from_millis(self.rto as u64));
         }
 
+        println!(
+            "\t\t\tWrite is ready: {}, Compute RTO: {}",
+            before_len < self.outgoing.len(),
+            compute_rto
+        );
         (before_len < self.outgoing.len(), compute_rto.then_some(r))
     }
 
@@ -755,12 +778,14 @@ impl TCB {
             self.snd.mss, self.cwnd, self.ssthresh
         );
         if self.is_slow_start() {
+            println!("\t\t\tSlow start");
             /*
             During slow start, a TCP increments cwnd by at most SMSS bytes for
             each ACK received that cumulatively acknowledges new data.
             */
             self.cwnd += self.snd.mss as u32;
         } else {
+            println!("\t\t\tCongestion avoidance");
             /*
             Another common formula that a TCP MAY use to update cwnd during
             congestion avoidance is given in equation (3):
@@ -831,7 +856,7 @@ impl TCB {
         Whenever RTO is computed, if it is less than 1 second, then the
         RTO SHOULD be rounded up to 1 second.
         */
-        self.rto = cmp::min(self.rto, 1000);
+        self.rto = cmp::max(self.rto, 1000);
     }
 
     pub fn on_segment(
@@ -1328,16 +1353,21 @@ impl TCB {
 
                 self.incoming.extend(data.iter());
 
+                let pre_nxt = self.rcv.nxt;
                 self.rcv.nxt = self
                     .rcv
                     .nxt
                     .wrapping_add(acc_len as u32)
                     .wrapping_add(if process_fin { 1 } else { 0 });
 
+                let pre_wnd = self.rcv.wnd;
                 self.rcv.wnd = self.rcv.wnd - acc_len as u16;
 
-                println!("\tAck data");
-                write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
+                // Only ack if accepted new data, or the window was zero and this is a probe segment
+                if wrapping_lt(pre_nxt, self.rcv.nxt) || pre_wnd == 0 {
+                    println!("\tAck data");
+                    write_ack(&ip4h, &tcph, self.snd.nxt, self.rcv.nxt, self.rcv.wnd, tun);
+                }
 
                 wake_up_reader = !data.is_empty();
             } else if self.state == State::CloseWait

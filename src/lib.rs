@@ -137,11 +137,9 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
 
         let mut to_be_deleted = vec![];
         for (quad, entry) in manager.streams.iter_mut() {
-            println!("On tick stream quad: {:?}", quad);
             if entry.tcb.on_tick(&mut tun) {
                 to_be_deleted.push(*quad);
             }
-            println!("----------------------------------------------");
         }
         for quad in to_be_deleted {
             manager.streams.remove(&quad).unwrap();
@@ -149,11 +147,9 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
 
         let mut to_be_deleted = vec![];
         for (quad, tcb) in manager.pending.iter_mut() {
-            println!("On tick pending quad: {:?}", quad);
             if tcb.on_tick(&mut tun) {
                 to_be_deleted.push(*quad);
             }
-            println!("----------------------------------------------");
         }
         for quad in to_be_deleted {
             manager.streams.remove(&quad).unwrap();
@@ -301,6 +297,5 @@ fn segment_loop(mut tun: Tun, manager: Arc<Mutex<Manager>>) -> ! {
                 todo!()
             }
         }
-        println!("----------------------------------------------");
     }
 }
